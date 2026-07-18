@@ -1,0 +1,3513 @@
+# isha_all_in_one.py – ISHA GUI, wired up to a local Ollama model (gemma3n:e4b)
+# Single-file build: merges update.py + isha_tools.py + isha_os_control.py +
+# isha_hand_control.py, and fixes the mediapipe 'solutions' AttributeError
+# (see the MEDIAPIPE FIX note further down, in the hand-control section).
+
+import sys, math, random, os, json, subprocess, ctypes, re, time, tempfile, asyncio, fnmatch, webbrowser
+from datetime import datetime
+from pathlib import Path
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
+    QLineEdit, QLabel, QScrollArea, QFrame, QSizePolicy,
+    QSystemTrayIcon, QMenu, QAction, QSlider, QListWidget, QListWidgetItem,
+    QGraphicsDropShadowEffect, QPushButton, QDialog, QTextEdit,
+    QSplitter, QAbstractScrollArea, QComboBox, QCheckBox, QProgressBar,
+    QMessageBox, QSpinBox, QDoubleSpinBox,
+)
+from PyQt5.QtCore import (
+    Qt, QTimer, QThread, QObject, pyqtSignal, QCoreApplication,
+    QPropertyAnimation, QEasingCurve, QPointF, QRectF,
+    QVariantAnimation, QPoint, QSize, QProcess,
+)
+from PyQt5.QtGui import (
+    QPainter, QColor, QPen, QBrush,
+    QLinearGradient, QRadialGradient,
+    QPainterPath, QFont, QFontMetrics, QIcon, QPixmap,
+    QTextOption, QImage,
+)
+
+# ------------------------------------------------
+# Colour palette (same as original)
+C_NEON   = QColor(0, 240, 255)
+C_PINK   = QColor(255, 0, 127)
+C_BG     = QColor(7, 10, 20)
+C_TEXT   = QColor(200, 230, 255)
+C_DIM    = QColor(60, 100, 140)
+
+# ------------------------------------------------
+# Helper: silent subprocess (stub)
+def _popen_silent(cmd: str) -> None:
+    print(f"[STUB] would run: {cmd}")
+
+# ------------------------------------------------
+# Optional backends: local LLM (Ollama), voice output (Edge-TTS), mic input (SpeechRecognition)
+# Each is wrapped so the app still runs (with a friendly warning) if a package is missing.
+try:
+    import requests
+    _REQUESTS_OK = True
+except Exception:
+    _REQUESTS_OK = False
+
+try:
+    import edge_tts
+    import pygame
+    _TTS_OK = True
+except Exception:
+    _TTS_OK = False
+
+try:
+    import speech_recognition as sr
+    _STT_OK = True
+except Exception:
+    _STT_OK = False
+
+
+# ======================================================================
+# MERGED MODULE 1/3: isha_os_control.py  (Windows window/stats/browser/file control)
+
+# ======================================================================
+
+try:
+    import psutil
+    _PSUTIL_OK = True
+except Exception:
+    _PSUTIL_OK = False
+
+try:
+    import win32gui
+    import win32con
+    import win32process
+    import win32api
+    import win32com.client   # for AttachThreadInput-free foreground switch fallback
+    _WIN32_OK = True
+except Exception:
+    _WIN32_OK = False
+
+def _result(success: bool, message: str, data=None) -> dict:
+    return {"success": success, "message": message, "data": data}
+
+
+# ------------------------------------------------------------------
+# 1 & 3 & 4 — the actual OS-control logic (pure, synchronous, no Qt here)
+# ------------------------------------------------------------------
+class WindowsController:
+    """All Windows-control primitives ISHA can use. Every public method
+    is synchronous and safe to run off the UI thread via OSTaskWorker."""
+
+    KNOWN_BROWSERS = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe"}
+
+    # ---------------- Window management ----------------
+    def _require_win32(self):
+        if not _WIN32_OK:
+            raise RuntimeError("pywin32 not installed. Install: pip install pywin32")
+
+    def list_open_windows(self) -> dict:
+        """Return every visible top-level window with a title."""
+        self._require_win32()
+        windows = []
+
+        def _enum_handler(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
+                title = win32gui.GetWindowText(hwnd)
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                windows.append({"hwnd": hwnd, "title": title, "pid": pid})
+
+        win32gui.EnumWindows(_enum_handler, None)
+        return _result(True, f"{len(windows)} windows open.", windows)
+
+    def get_active_window(self) -> dict:
+        self._require_win32()
+        hwnd = win32gui.GetForegroundWindow()
+        title = win32gui.GetWindowText(hwnd) if hwnd else ""
+        return _result(True, title or "(no title)", {"hwnd": hwnd, "title": title})
+
+    def _find_window(self, title_substring: str):
+        """Case-insensitive partial match against open window titles."""
+        needle = (title_substring or "").strip().lower()
+        if not needle:
+            return None
+        match = None
+
+        def _enum_handler(hwnd, _):
+            nonlocal match
+            if match is not None:
+                return
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd)
+                if title and needle in title.lower():
+                    match = hwnd
+
+        win32gui.EnumWindows(_enum_handler, None)
+        return match
+
+    def minimize_window(self, title: str = "") -> dict:
+        self._require_win32()
+        hwnd = self._find_window(title) if title else win32gui.GetForegroundWindow()
+        if not hwnd:
+            return _result(False, f"'{title}' naam ki koi window nahi mili.")
+        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+        return _result(True, f"'{win32gui.GetWindowText(hwnd)}' minimize kar diya.")
+
+    def maximize_window(self, title: str = "") -> dict:
+        self._require_win32()
+        hwnd = self._find_window(title) if title else win32gui.GetForegroundWindow()
+        if not hwnd:
+            return _result(False, f"'{title}' naam ki koi window nahi mili.")
+        win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+        return _result(True, f"'{win32gui.GetWindowText(hwnd)}' maximize kar diya.")
+
+    def close_window(self, title: str) -> dict:
+        self._require_win32()
+        hwnd = self._find_window(title)
+        if not hwnd:
+            return _result(False, f"'{title}' naam ki koi window nahi mili.")
+        name = win32gui.GetWindowText(hwnd)
+        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        return _result(True, f"'{name}' close kar diya.")
+
+    def switch_to_window(self, title: str) -> dict:
+        """Bring a window to the foreground (like a targeted Alt-Tab)."""
+        self._require_win32()
+        hwnd = self._find_window(title)
+        if not hwnd:
+            return _result(False, f"'{title}' naam ki koi window nahi mili.")
+        name = win32gui.GetWindowText(hwnd)
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            # Windows sometimes blocks SetForegroundWindow from a background
+            # thread; attaching input threads first makes it reliable.
+            fg_hwnd = win32gui.GetForegroundWindow()
+            fg_thread = win32process.GetWindowThreadProcessId(fg_hwnd)[0]
+            target_thread = win32process.GetWindowThreadProcessId(hwnd)[0]
+            if fg_thread != target_thread:
+                win32process.AttachThreadInput(fg_thread, target_thread, True)
+                win32gui.SetForegroundWindow(hwnd)
+                win32process.AttachThreadInput(fg_thread, target_thread, False)
+            else:
+                win32gui.SetForegroundWindow(hwnd)
+        except Exception as e:
+            return _result(False, f"'{name}' pe switch nahi ho paaya: {e}")
+        return _result(True, f"'{name}' pe switch kar diya.")
+
+    # ---------------- System stats ----------------
+    def get_system_stats(self) -> dict:
+        if not _PSUTIL_OK:
+            return _result(False, "psutil install karo: pip install psutil")
+        stats = {
+            "cpu_percent": psutil.cpu_percent(interval=0.3),
+            "ram_percent": psutil.virtual_memory().percent,
+            "ram_used_mb": psutil.virtual_memory().used // (1024 ** 2),
+            "ram_total_mb": psutil.virtual_memory().total // (1024 ** 2),
+        }
+        batt = psutil.sensors_battery() if hasattr(psutil, "sensors_battery") else None
+        if batt is not None:
+            stats["battery_percent"] = batt.percent
+            stats["battery_plugged"] = batt.power_plugged
+        else:
+            stats["battery_percent"] = None
+            stats["battery_plugged"] = None
+        msg = f"CPU {stats['cpu_percent']:.0f}% · RAM {stats['ram_percent']:.0f}%"
+        if stats["battery_percent"] is not None:
+            msg += f" · Battery {stats['battery_percent']:.0f}%"
+        return _result(True, msg, stats)
+
+    # ---------------- Mouse scroll (used by hand-gesture control) ----------------
+    def scroll(self, direction: str, clicks: int = 1) -> dict:
+        """Send a native mouse-wheel event. Fast, synchronous, safe to call
+        directly from the UI thread (no blocking I/O involved)."""
+        self._require_win32()
+        wheel_delta = 120 * max(1, int(clicks))
+        if direction == "down":
+            wheel_delta = -wheel_delta
+        elif direction != "up":
+            return _result(False, f"Invalid scroll direction '{direction}'.")
+        try:
+            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, wheel_delta, 0)
+        except Exception as e:
+            return _result(False, f"Scroll fail ho gaya: {e}")
+        return _result(True, f"Scrolled {direction}.")
+
+    # ---------------- Browser automation ----------------
+    def open_url(self, url: str) -> dict:
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return _result(False, "Sirf http/https URLs allowed hain.")
+        webbrowser.open(url)
+        return _result(True, f"Browser me {url} khol diya.")
+
+    def close_active_browser_tab(self) -> dict:
+        """Focuses the active window only if it belongs to a known browser
+        process, then sends Ctrl+W. Refuses to act on any other app —
+        this is the safety boundary that stops it from closing random windows."""
+        self._require_win32()
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return _result(False, "Koi active window nahi mili.")
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        try:
+            proc = psutil.Process(pid) if _PSUTIL_OK else None
+            proc_name = proc.name().lower() if proc else ""
+        except Exception:
+            proc_name = ""
+        if proc_name not in self.KNOWN_BROWSERS:
+            return _result(False, "Active window ek browser nahi hai, tab close nahi kiya.")
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.15)
+        # Ctrl+W via keybd_event — same low-level approach already used for
+        # media keys elsewhere in the app.
+        VK_CONTROL, VK_W = 0x11, 0x57
+        win32api.keybd_event(VK_CONTROL, 0, 0, 0)
+        win32api.keybd_event(VK_W, 0, 0, 0)
+        win32api.keybd_event(VK_W, 0, win32con.KEYEVENTF_KEYUP, 0)
+        win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+        return _result(True, "Active browser tab close kar diya.")
+
+    # ---------------- File-system operations ----------------
+    def _safe_base_dirs(self):
+        home = Path.home()
+        return {
+            "desktop": home / "Desktop",
+            "documents": home / "Documents",
+            "downloads": home / "Downloads",
+            "home": home,
+        }
+
+    def create_folder_on_desktop(self, folder_name: str) -> dict:
+        name = os.path.basename(str(folder_name).strip())  # strips any path components
+        if not name or name in (".", ".."):
+            return _result(False, "Invalid folder name.")
+        target = self._safe_base_dirs()["desktop"] / name
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return _result(False, f"Folder nahi ban paaya: {e}")
+        return _result(True, f"'{name}' folder Desktop par ban gaya.", str(target))
+
+    def search_files(self, query: str, location: str = "home", max_results: int = 25) -> dict:
+        """Search filenames (glob-style, e.g. '*.pdf' or 'invoice*') within a
+        whitelisted base directory only — never the whole filesystem."""
+        bases = self._safe_base_dirs()
+        base = bases.get(location, bases["home"])
+        query = (query or "").strip()
+        if not query:
+            return _result(False, "Search query khaali hai.")
+        pattern = query if any(ch in query for ch in "*?") else f"*{query}*"
+
+        matches = []
+        try:
+            for root, dirs, files in os.walk(base):
+                for fname in files:
+                    if fnmatch.fnmatch(fname.lower(), pattern.lower()):
+                        matches.append(str(Path(root) / fname))
+                        if len(matches) >= max_results:
+                            raise StopIteration
+        except StopIteration:
+            pass
+        except Exception as e:
+            return _result(False, f"Search fail ho gaya: {e}")
+
+        if not matches:
+            return _result(True, f"'{query}' se match karti koi file nahi mili.", [])
+        return _result(True, f"{len(matches)} file(s) mili.", matches)
+
+
+# ------------------------------------------------------------------
+# 2. Generic async-safe worker — run ANY WindowsController method off
+#    the UI thread without writing a new QThread subclass every time.
+# ------------------------------------------------------------------
+class OSTaskWorker(QThread):
+    task_finished = pyqtSignal(dict)   # the {"success", "message", "data"} result
+    task_error    = pyqtSignal(str)
+
+    def __init__(self, method, *args, **kwargs):
+        super().__init__()
+        self._method = method
+        self._args = args
+        self._kwargs = kwargs
+
+    def run(self):
+        try:
+            result = self._method(*self._args, **self._kwargs)
+            self.task_finished.emit(result)
+        except Exception as e:
+            self.task_error.emit(str(e))
+
+
+# ------------------------------------------------------------------
+# Live system-stats poller — runs on its own QThread, emits a dict every
+# `interval` seconds. Bind `stats_updated` to a QLabel/UI update slot.
+# ------------------------------------------------------------------
+class SystemStatsMonitor(QThread):
+    stats_updated = pyqtSignal(dict)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, controller: "WindowsController", interval: float = 2.0, parent=None):
+        super().__init__(parent)
+        self._controller = controller
+        self._interval = max(0.5, float(interval))
+        self._running = False
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        self._running = True
+        while self._running:
+            result = self._controller.get_system_stats()
+            if result["success"]:
+                self.stats_updated.emit(result["data"])
+            else:
+                self.error_occurred.emit(result["message"])
+            # Sleep in small chunks so stop() takes effect quickly
+            slept = 0.0
+            while self._running and slept < self._interval:
+                self.msleep(100)
+                slept += 0.1
+
+
+# ======================================================================
+# MERGED MODULE 2/3: isha_hand_control.py  (webcam hand-gesture control)
+#
+# >>> MEDIAPIPE FIX <<<
+# The crash — AttributeError: module 'mediapipe' has no attribute 'solutions' —
+# happens because mediapipe >= 0.10.30 removed the legacy `mp.solutions` API
+# (mp.solutions.hands, mp.solutions.drawing_utils, ...) that this hand-tracking
+# code is built on. It's not a bug in this file; Google deprecated/removed that
+# API from the pip package. Two ways to fix it, pick one:
+#   A) Recommended, no code changes: pin an older mediapipe release that still
+#      ships `solutions` and has a cp310 win_amd64 wheel:
+#         pip uninstall mediapipe -y
+#         pip install mediapipe==0.10.14
+#   B) Migrate to the new MediaPipe Tasks API (mediapipe.tasks.python.vision.
+#      HandLandmarker) — more work, but future-proof since legacy `solutions`
+#      is unmaintained upstream.
+# This build also now fails soft instead of crashing the thread: if `solutions`
+# is missing, HandGestureWorker emits a clear error_occurred signal (which the
+# main window already turns into a chat message) instead of raising an
+# uncaught AttributeError that killed the QThread and leaked the webcam handle.
+
+# ======================================================================
+
+try:
+    import cv2
+    _CV2_OK = True
+except Exception:
+    _CV2_OK = False
+
+try:
+    import mediapipe as mp
+    if not hasattr(mp, "solutions"):
+        # mediapipe >= 0.10.30 deleted the legacy `mp.solutions` API this module
+        # relies on (mp.solutions.hands / .drawing_utils). Import succeeds but the
+        # attribute is gone -- that AttributeError is exactly what crashed this
+        # worker thread before. Fix:
+        #   pip uninstall mediapipe -y
+        #   pip install mediapipe==0.10.14
+        # (0.10.14 is the last well-tested release that still ships `solutions`
+        # and has a cp310 win_amd64 wheel, matching this project's Python 3.10.)
+        raise ImportError(
+            "mediapipe is installed but its legacy 'solutions' API is missing "
+            "(removed in mediapipe>=0.10.30). Fix: pip uninstall mediapipe -y && "
+            "pip install mediapipe==0.10.14"
+        )
+    _MEDIAPIPE_OK = True
+    _MEDIAPIPE_ERROR = ""
+except Exception as e:
+    _MEDIAPIPE_OK = False
+    _MEDIAPIPE_ERROR = str(e)
+
+class HandGestureWorker(QThread):
+    # (action_name, payload) — main-thread slot decides what to do with it.
+    # action_name in {"volume_set", "mute_toggle", "scroll"}
+    gesture_action = pyqtSignal(str, dict)
+    frame_ready    = pyqtSignal(QImage)   # optional live preview (only if emit_preview=True)
+    status_changed = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+
+    # ---- tunables ----
+    VOLUME_TOP_Y        = 0.15   # normalized hand-y treated as 100% volume
+    VOLUME_BOTTOM_Y      = 0.85   # normalized hand-y treated as 0% volume
+    VOLUME_MIN_DELTA     = 2      # only emit a new volume if it changed by this much (%)
+    MUTE_COOLDOWN_SEC    = 1.2    # minimum gap between fist-triggered mute toggles
+    SCROLL_JITTER_GUARD  = 0.008  # ignore vertical moves smaller than this (normalized)
+    FRAME_DELAY_MS       = 40     # ~25 fps cap — plenty for gestures, keeps CPU low
+
+    def __init__(self, camera_index: int = 0, emit_preview: bool = True, parent=None):
+        super().__init__(parent)
+        self.camera_index = camera_index
+        self.emit_preview = emit_preview
+        self._running = False
+        # per-run gesture state (reset in run())
+        self._last_mute_time = 0.0
+        self._mute_armed = True
+        self._last_emitted_volume = None
+        self._scroll_prev_y = None
+
+    def stop(self):
+        self._running = False
+
+    # ------------------------------------------------------------
+    def run(self):
+        if not _CV2_OK:
+            self.error_occurred.emit("OpenCV missing. Install: pip install opencv-python")
+            return
+        if not _MEDIAPIPE_OK:
+            self.error_occurred.emit(
+                "MediaPipe not usable: " + (_MEDIAPIPE_ERROR or "install with 'pip install mediapipe'")
+            )
+            return
+
+        cap = None
+        hands = None
+        try:
+            cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                self.error_occurred.emit("Webcam open nahi ho paaya (index/permissions check karo).")
+                return
+
+            mp_hands = mp.solutions.hands
+            hands = mp_hands.Hands(
+                model_complexity=0,          # lightest model — real-time on CPU
+                max_num_hands=1,
+                min_detection_confidence=0.6,
+                min_tracking_confidence=0.5,
+            )
+            mp_draw = mp.solutions.drawing_utils
+
+            # reset state for this session
+            self._last_mute_time = 0.0
+            self._mute_armed = True
+            self._last_emitted_volume = None
+            self._scroll_prev_y = None
+
+            self._running = True
+            self.status_changed.emit("Hand control active.")
+            while self._running:
+                ok, frame = cap.read()
+                if not ok:
+                    self.msleep(self.FRAME_DELAY_MS)
+                    continue
+
+                frame = cv2.flip(frame, 1)  # mirror, feels natural to the user
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = hands.process(rgb)
+
+                if results.multi_hand_landmarks:
+                    landmarks = results.multi_hand_landmarks[0]
+                    if self.emit_preview:
+                        mp_draw.draw_landmarks(frame, landmarks, mp_hands.HAND_CONNECTIONS)
+                    self._interpret_gesture(landmarks.landmark)
+                else:
+                    self._scroll_prev_y = None
+                    self._mute_armed = True
+
+                if self.emit_preview:
+                    self._emit_frame(frame)
+
+                self.msleep(self.FRAME_DELAY_MS)
+        except Exception as e:
+            self.error_occurred.emit(f"Hand control error: {e}")
+        finally:
+            if cap is not None:
+                cap.release()
+            if hands is not None:
+                hands.close()
+            self.status_changed.emit("Hand control stopped.")
+
+    # ------------------------------------------------------------
+    def _emit_frame(self, bgr_frame):
+        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        # .copy() detaches from the numpy buffer, which is reused next loop
+        self.frame_ready.emit(qimg.copy())
+
+    def _extended_fingers(self, lm) -> int:
+        """Counts extended fingers among index/middle/ring/pinky only
+        (thumb skipped — its extended/curled test depends on handedness
+        and is unreliable enough to just leave out of a simple gesture set)."""
+        tip_pip_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
+        return sum(1 for tip, pip in tip_pip_pairs if lm[tip].y < lm[pip].y)
+
+    def _interpret_gesture(self, lm):
+        extended = self._extended_fingers(lm)
+        hand_y = lm[0].y  # wrist, normalized 0 (top of frame) .. 1 (bottom)
+
+        if extended >= 4:
+            # Open palm -> map vertical hand position straight to volume %
+            self._scroll_prev_y = None
+            self._mute_armed = True
+            pct = self._y_to_volume_percent(hand_y)
+            if self._last_emitted_volume is None or abs(pct - self._last_emitted_volume) >= self.VOLUME_MIN_DELTA:
+                self._last_emitted_volume = pct
+                self.gesture_action.emit("volume_set", {"percent": pct})
+
+        elif extended == 0:
+            # Fist -> mute toggle, debounced so holding the pose doesn't spam it
+            now = time.time()
+            if self._mute_armed and (now - self._last_mute_time) > self.MUTE_COOLDOWN_SEC:
+                self._last_mute_time = now
+                self._mute_armed = False
+                self.gesture_action.emit("mute_toggle", {})
+
+        elif extended == 2:
+            # Index + middle -> scroll, direction from frame-to-frame vertical movement
+            self._mute_armed = True
+            if self._scroll_prev_y is not None:
+                delta = hand_y - self._scroll_prev_y
+                if abs(delta) > self.SCROLL_JITTER_GUARD:
+                    direction = "down" if delta > 0 else "up"
+                    self.gesture_action.emit("scroll", {"direction": direction})
+            self._scroll_prev_y = hand_y
+
+        else:
+            self._scroll_prev_y = None
+            self._mute_armed = True
+
+    def _y_to_volume_percent(self, y: float) -> int:
+        y = max(self.VOLUME_TOP_Y, min(self.VOLUME_BOTTOM_Y, y))
+        span = self.VOLUME_BOTTOM_Y - self.VOLUME_TOP_Y
+        pct = 100 * (1 - (y - self.VOLUME_TOP_Y) / span)
+        return int(max(0, min(100, round(pct))))
+
+
+# ======================================================================
+# MERGED MODULE 3/3: isha_tools.py  (LLM function-calling engine)
+
+# ======================================================================
+
+try:
+    from ctypes import cast, POINTER
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    _PYCAW_OK = True
+except Exception:
+    _PYCAW_OK = False
+
+# WindowsController is defined above in this same file now (was: import from
+# isha_os_control.py) -- it's stateless, so instantiating it directly here is
+# equivalent to the old cross-module import and can't fail on its own.
+_os_controller = WindowsController()
+
+TOOL_REGISTRY: dict = {}
+
+
+def tool(name: str, description: str, parameters: dict = None):
+    """Decorator that registers a function as an LLM-callable tool."""
+    def _wrap(func):
+        TOOL_REGISTRY[name] = {
+            "description": description,
+            "parameters": parameters or {},
+            "handler": func,
+        }
+        return func
+    return _wrap
+
+
+# ------------------------------------------------------------------
+# 2. Built-in tools
+#    Every handler receives a *validated* args dict and returns a
+#    short string describing what happened (used for TTS/chat reply).
+# ------------------------------------------------------------------
+@tool("open_notepad", "Open Windows Notepad.")
+def _open_notepad(args: dict) -> str:
+    subprocess.Popen(["notepad.exe"])
+    return "Notepad khol diya."
+
+
+@tool("open_calculator", "Open the Windows Calculator app.")
+def _open_calculator(args: dict) -> str:
+    subprocess.Popen(["calc.exe"])
+    return "Calculator khol diya."
+
+
+@tool(
+    "open_browser",
+    "Open the default web browser, optionally navigating to a URL.",
+    {"url": {"type": "string", "required": False,
+              "description": "Full https:// URL to open. Omit for a blank browser window."}},
+)
+def _open_browser(args: dict) -> str:
+    url = args.get("url") or "https://www.google.com"
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return "Sirf http/https URLs allowed hain, is request ko reject kar diya."
+    webbrowser.open(url)
+    return f"Browser me {url} khol diya."
+
+
+@tool("open_task_manager", "Open the Windows Task Manager.")
+def _open_task_manager(args: dict) -> str:
+    try:
+        os.startfile("taskmgr.exe")
+    except Exception:
+        windir = os.environ.get("WINDIR", r"C:\Windows")
+        subprocess.Popen([os.path.join(windir, "System32", "taskmgr.exe")])
+    return "Task Manager khol diya."
+
+
+@tool(
+    "mute_system",
+    "Mute or unmute the system audio output.",
+    {"muted": {"type": "boolean", "required": True,
+                "description": "true to mute, false to unmute"}},
+)
+def _mute_system(args: dict) -> str:
+    muted = bool(args["muted"])
+    if _PYCAW_OK:
+        try:
+            devices = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            volume = cast(interface, POINTER(IAudioEndpointVolume))
+            volume.SetMute(1 if muted else 0, None)
+            return "System mute kar diya." if muted else "System unmute kar diya."
+        except Exception as e:
+            return f"Mute toggle fail ho gaya: {e}"
+    try:
+        VK_VOLUME_MUTE = 0xAD
+        user32 = ctypes.windll.user32
+        user32.keybd_event(VK_VOLUME_MUTE, 0, 0, 0)
+        user32.keybd_event(VK_VOLUME_MUTE, 0, 2, 0)
+        return "Mute toggle kar diya."
+    except Exception as e:
+        return f"Mute is platform pe available nahi: {e}"
+
+
+@tool(
+    "set_volume",
+    "Set the system master volume to an exact percentage.",
+    {"percent": {"type": "integer", "required": True,
+                  "description": "Volume level 0-100"}},
+)
+def _set_volume(args: dict) -> str:
+    percent = int(args["percent"])
+    percent = max(0, min(100, percent))
+    if _PYCAW_OK:
+        try:
+            devices = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            volume = cast(interface, POINTER(IAudioEndpointVolume))
+            volume.SetMasterVolumeLevelScalar(percent / 100.0, None)
+            return f"Volume {percent}% set kar diya."
+        except Exception as e:
+            return f"Volume set nahi ho paaya: {e}"
+    return "Exact volume set karne ke liye 'pip install pycaw comtypes' install karo."
+
+
+@tool("check_cpu_usage", "Get the current CPU usage percentage.")
+def _check_cpu(args: dict) -> str:
+    if not _PSUTIL_OK:
+        return "CPU usage check karne ke liye 'pip install psutil' install karo."
+    pct = psutil.cpu_percent(interval=0.4)
+    return f"CPU abhi {pct:.0f}% use ho raha hai."
+
+
+@tool("check_memory_usage", "Get current RAM usage.")
+def _check_memory(args: dict) -> str:
+    if not _PSUTIL_OK:
+        return "RAM usage check karne ke liye 'pip install psutil' install karo."
+    mem = psutil.virtual_memory()
+    return f"RAM {mem.percent:.0f}% use ho rahi hai ({mem.used // (1024**2)}MB / {mem.total // (1024**2)}MB)."
+
+
+@tool("check_battery", "Get current battery percentage and charging status.")
+def _check_battery(args: dict) -> str:
+    if not _PSUTIL_OK or not hasattr(psutil, "sensors_battery"):
+        return "Battery info is device pe available nahi hai."
+    batt = psutil.sensors_battery()
+    if batt is None:
+        return "Koi battery detect nahi hui (desktop PC ho sakta hai)."
+    state = "charging" if batt.power_plugged else "on battery"
+    return f"Battery {batt.percent:.0f}% hai, {state}."
+
+
+@tool("get_time", "Get the current local time.")
+def _get_time(args: dict) -> str:
+    return f"Abhi time hai {datetime.now().strftime('%I:%M %p')}."
+
+
+@tool("get_date", "Get the current date.")
+def _get_date(args: dict) -> str:
+    return f"Aaj ki date hai {datetime.now().strftime('%A, %d %B %Y')}."
+
+
+@tool("lock_screen", "Lock the Windows workstation.")
+def _lock_screen(args: dict) -> str:
+    try:
+        ctypes.windll.user32.LockWorkStation()
+        return "Screen lock kar di."
+    except Exception as e:
+        return f"Screen lock nahi ho paayi: {e}"
+
+
+# ---- Window management / browser tabs / file ops (isha_os_control.py) ----
+def _require_os_control():
+    if not _WIN32_OK:
+        raise RuntimeError("pywin32 not installed. Install: pip install pywin32")
+
+
+@tool(
+    "minimize_window",
+    "Minimize a window. If title is omitted, minimizes the current active window.",
+    {"title": {"type": "string", "required": False,
+                "description": "Partial/substring of the window title, e.g. 'Notepad'"}},
+)
+def _minimize_window(args: dict) -> str:
+    _require_os_control()
+    res = _os_controller.minimize_window(args.get("title", ""))
+    if not res["success"]:
+        raise ToolError(res["message"])
+    return res["message"]
+
+
+@tool(
+    "maximize_window",
+    "Maximize a window. If title is omitted, maximizes the current active window.",
+    {"title": {"type": "string", "required": False,
+                "description": "Partial/substring of the window title"}},
+)
+def _maximize_window(args: dict) -> str:
+    _require_os_control()
+    res = _os_controller.maximize_window(args.get("title", ""))
+    if not res["success"]:
+        raise ToolError(res["message"])
+    return res["message"]
+
+
+@tool(
+    "close_window",
+    "Close a window by (partial) title.",
+    {"title": {"type": "string", "required": True,
+                "description": "Partial/substring of the window title, e.g. 'Chrome'"}},
+)
+def _close_window(args: dict) -> str:
+    _require_os_control()
+    res = _os_controller.close_window(args["title"])
+    if not res["success"]:
+        raise ToolError(res["message"])
+    return res["message"]
+
+
+@tool(
+    "switch_window",
+    "Switch to (bring to foreground) a window by partial title, like a targeted Alt-Tab.",
+    {"title": {"type": "string", "required": True,
+                "description": "Partial/substring of the window title"}},
+)
+def _switch_window(args: dict) -> str:
+    _require_os_control()
+    res = _os_controller.switch_to_window(args["title"])
+    if not res["success"]:
+        raise ToolError(res["message"])
+    return res["message"]
+
+
+@tool(
+    "open_url",
+    "Open a specific URL in the default web browser.",
+    {"url": {"type": "string", "required": True, "description": "Full https:// URL"}},
+)
+def _open_url(args: dict) -> str:
+    _require_os_control()
+    res = _os_controller.open_url(args["url"])
+    if not res["success"]:
+        raise ToolError(res["message"])
+    return res["message"]
+
+
+@tool("close_browser_tab", "Close the current tab of the active browser window (Ctrl+W).")
+def _close_browser_tab(args: dict) -> str:
+    _require_os_control()
+    res = _os_controller.close_active_browser_tab()
+    if not res["success"]:
+        raise ToolError(res["message"])
+    return res["message"]
+
+
+@tool(
+    "create_desktop_folder",
+    "Create a new folder on the Desktop.",
+    {"folder_name": {"type": "string", "required": True, "description": "Name of the new folder"}},
+)
+def _create_desktop_folder(args: dict) -> str:
+    _require_os_control()
+    res = _os_controller.create_folder_on_desktop(args["folder_name"])
+    if not res["success"]:
+        raise ToolError(res["message"])
+    return res["message"]
+
+
+@tool(
+    "search_files",
+    "Search for files by name inside a whitelisted user folder (Desktop, Documents, Downloads, or full home).",
+    {
+        "query": {"type": "string", "required": True,
+                   "description": "Filename or pattern to search for, e.g. 'invoice' or '*.pdf'"},
+        "location": {"type": "string", "required": False,
+                      "description": "One of: desktop, documents, downloads, home (default: home)"},
+    },
+)
+def _search_files(args: dict) -> str:
+    _require_os_control()
+    res = _os_controller.search_files(args["query"], args.get("location", "home"))
+    if not res["success"]:
+        raise ToolError(res["message"])
+    if res["data"]:
+        preview = "; ".join(res["data"][:5])
+        return f"{res['message']} Examples: {preview}"
+    return res["message"]
+
+
+@tool("get_system_stats", "Get current CPU, RAM, and Battery usage.")
+def _get_system_stats(args: dict) -> str:
+    _require_os_control()
+    res = _os_controller.get_system_stats()
+    if not res["success"]:
+        raise ToolError(res["message"])
+    return res["message"]
+
+
+# ------------------------------------------------------------------
+# 3. Prompt builder – turns the registry into instructions the LLM
+#    can follow, and into a JSON schema for validation.
+# ------------------------------------------------------------------
+def build_tool_system_prompt() -> str:
+    tool_lines = []
+    for name, spec in TOOL_REGISTRY.items():
+        params = spec["parameters"]
+        if params:
+            param_desc = ", ".join(
+                f'{p}({"required" if pv.get("required") else "optional"}, {pv["type"]}): {pv.get("description", "")}'
+                for p, pv in params.items()
+            )
+        else:
+            param_desc = "no parameters"
+        tool_lines.append(f'- "{name}": {spec["description"]} [{param_desc}]')
+    tools_block = "\n".join(tool_lines)
+
+    return f"""You are ISHA's intent router. Decide if the user's message requires
+calling one of the tools below, or if it is just a normal conversational message.
+
+Available tools:
+{tools_block}
+
+Respond with ONLY a single JSON object, no other text, no markdown fences, in this exact shape:
+{{"action": "tool_call", "tool": "<tool_name>", "arguments": {{...}}}}
+or, if no tool applies:
+{{"action": "chat_reply", "tool": null, "arguments": {{}}}}
+
+Rules:
+- Only use a tool name from the list above, spelled exactly as shown.
+- Only include arguments that are defined for that tool.
+- If required arguments are missing from the user's message, use action "chat_reply" instead
+  and ask the user for the missing detail in natural conversation.
+- Never invent a tool name that isn't listed.
+- Output must be valid JSON and nothing else."""
+
+
+# ------------------------------------------------------------------
+# 4. Safe JSON extraction from raw LLM text
+# ------------------------------------------------------------------
+def parse_router_json(raw_text: str):
+    """Best-effort, defensive extraction of the router's JSON object.
+    Returns a dict or None if nothing parseable was found."""
+    if not raw_text:
+        return None
+    text = raw_text.strip()
+    # Strip common markdown fences some models add despite instructions
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Fallback: find the first balanced {...} block and try that
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    while start != -1:
+        try:
+            obj, _ = decoder.raw_decode(text, start)
+            return obj
+        except Exception:
+            start = text.find("{", start + 1)
+    return None
+
+
+# ------------------------------------------------------------------
+# 5. Validation + execution — the only place a tool actually runs
+# ------------------------------------------------------------------
+class ToolError(Exception):
+    pass
+
+
+def _validate_args(name: str, schema: dict, raw_args) -> dict:
+    if raw_args is None:
+        raw_args = {}
+    if not isinstance(raw_args, dict):
+        raise ToolError(f"'{name}' arguments must be a JSON object.")
+
+    clean = {}
+    for pname, pspec in schema.items():
+        if pname in raw_args:
+            value = raw_args[pname]
+            ptype = pspec["type"]
+            if ptype == "integer":
+                try:
+                    value = int(value)
+                except Exception:
+                    raise ToolError(f"'{pname}' must be an integer.")
+            elif ptype == "boolean":
+                if isinstance(value, str):
+                    value = value.strip().lower() in ("true", "1", "yes")
+                value = bool(value)
+            elif ptype == "string":
+                value = str(value)
+            clean[pname] = value
+        elif pspec.get("required"):
+            raise ToolError(f"Missing required argument '{pname}' for tool '{name}'.")
+
+    # Reject any argument the LLM invented that isn't in the schema —
+    # this is the key security boundary: unknown keys never reach the handler.
+    unknown = set(raw_args) - set(schema)
+    if unknown:
+        raise ToolError(f"Unknown argument(s) for '{name}': {', '.join(unknown)}")
+
+    return clean
+
+
+def execute_tool(name: str, raw_args) -> str:
+    """The single, secure entry point for running a tool.
+    - `name` must exactly match a registered tool (allow-list).
+    - `raw_args` is validated field-by-field against that tool's schema.
+    - Never eval()/exec()s anything, never shells out with an LLM-built string.
+    Raises ToolError on any problem; caller decides how to surface it.
+    """
+    if name not in TOOL_REGISTRY:
+        raise ToolError(f"Unknown tool '{name}'.")
+    spec = TOOL_REGISTRY[name]
+    clean_args = _validate_args(name, spec["parameters"], raw_args)
+    try:
+        return spec["handler"](clean_args)
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Tool '{name}' failed: {e}")
+
+
+# ======================================================================
+# Back to update.py: all three modules above are now local, so these always
+# succeed. Actual missing-dependency handling (pywin32 / opencv / mediapipe /
+# pycaw) still happens where it always did -- inside each function/worker.
+_TOOLS_OK = True
+ROUTER_SYSTEM_PROMPT = build_tool_system_prompt()
+_OS_CONTROL_OK = True
+_HAND_CONTROL_OK = True
+
+# ------------------------------------------------
+# Persistent day-by-day chat history
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "isha_chat_history.json")
+
+def load_history() -> dict:
+    """Load the full history dict: { 'YYYY-MM-DD': [ {time, role, text}, ... ] }"""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[History] Failed to load: {e}")
+            return {}
+    return {}
+
+def save_history(data: dict) -> None:
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[History] Failed to save: {e}")
+
+def log_chat_entry(role: str, text: str) -> None:
+    """Append one message to today's history bucket."""
+    date_key = datetime.now().strftime("%Y-%m-%d")
+    time_str = datetime.now().strftime("%I:%M %p")
+    data = load_history()
+    data.setdefault(date_key, []).append({"time": time_str, "role": role, "text": text})
+    save_history(data)
+
+def delete_all_history() -> None:
+    save_history({})
+
+# ------------------------------------------------
+# Persistent model / TTS configuration (survives restarts)
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "isha_config.json")
+
+DEFAULT_CONFIG = {
+    # Model & connection
+    "model":             "qwen2.5:1.5b",
+    "router_model":      "",       # empty = reuse "model" for intent routing too
+    "ollama_host":        "http://localhost:11434",
+    "tool_calling":        True,   # master on/off switch for the intent parser
+    # 1. Hardware & Speed
+    "gpu_layers":         -1,      # -1 = let Ollama decide, 0 = CPU only, N = layers on GPU
+    "cpu_threads":        0,       # 0 = auto
+    "batch_size":         512,
+    # 2. Memory & Chatting
+    "context_length":     4096,
+    "system_prompt":      "You are ISHA, a helpful voice assistant. Reply concisely.",
+    "stop_tokens":        [],
+    # 3. Creativity & sampling
+    "temperature":        0.8,
+    "top_p":              0.9,
+    "top_k":              40,
+    "min_p":              0.0,
+    "repeat_penalty":     1.1,
+    "presence_penalty":   0.0,
+    "frequency_penalty":  0.0,
+    # 4. Output & format
+    "json_mode":          False,
+    "streaming":          True,
+    "seed":               -1,      # -1 = random
+    "thinking_mode":      False,
+    # Voice (Edge-TTS)
+    "tts_enabled":        True,
+    "tts_voice":          "en-US-AriaNeural",
+    "tts_rate":           "+0%",
+}
+
+def load_config() -> dict:
+    cfg = DEFAULT_CONFIG.copy()
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            cfg.update(saved)
+        except Exception as e:
+            print(f"[Config] Failed to load: {e}")
+    return cfg
+
+def save_config(cfg: dict) -> None:
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[Config] Failed to save: {e}")
+
+# ------------------------------------------------
+# System audio control (mute / volume)
+# Uses pycaw for real, absolute volume control when available
+# (pip install pycaw comtypes). Always falls back to the Windows
+# media-mute key so the Mute button works even without pycaw.
+try:
+    from ctypes import cast, POINTER
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    _PYCAW_OK = True
+except Exception:
+    _PYCAW_OK = False
+
+def _get_volume_interface():
+    devices = AudioUtilities.GetSpeakers()
+    interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+    return cast(interface, POINTER(IAudioEndpointVolume))
+
+def set_system_mute(muted: bool) -> None:
+    if _PYCAW_OK:
+        try:
+            _get_volume_interface().SetMute(1 if muted else 0, None)
+            return
+        except Exception as e:
+            print(f"[Mute] pycaw failed, falling back: {e}")
+    try:
+        VK_VOLUME_MUTE = 0xAD
+        user32 = ctypes.windll.user32
+        user32.keybd_event(VK_VOLUME_MUTE, 0, 0, 0)
+        user32.keybd_event(VK_VOLUME_MUTE, 0, 2, 0)
+    except Exception as e:
+        print(f"[STUB] mute={muted}  (Windows-only feature: {e})")
+
+VK_VOLUME_DOWN = 0xAE
+VK_VOLUME_UP   = 0xAF
+
+def _press_volume_key(vk_code: int, times: int = 1) -> None:
+    user32 = ctypes.windll.user32
+    for _ in range(times):
+        user32.keybd_event(vk_code, 0, 0, 0)   # key down
+        user32.keybd_event(vk_code, 0, 2, 0)   # key up
+
+def set_system_volume(percent: int, previous_percent: int = None) -> None:
+    """Move the LIVE system volume toward `percent`.
+    Uses pycaw for an exact set if installed; otherwise nudges the
+    real Windows volume up/down (like pressing the volume keys) based
+    on how far the slider moved — this works with no extra installs."""
+    percent = max(0, min(100, percent))
+
+    if _PYCAW_OK:
+        try:
+            _get_volume_interface().SetMasterVolumeLevelScalar(percent / 100.0, None)
+            return
+        except Exception as e:
+            print(f"[Volume] pycaw failed, falling back to key-based control: {e}")
+
+    try:
+        if previous_percent is None:
+            previous_percent = percent
+        delta = percent - previous_percent
+        STEP = 2  # Windows moves ~2% per volume-key press by default
+        presses = round(abs(delta) / STEP)
+        if presses > 0:
+            vk = VK_VOLUME_UP if delta > 0 else VK_VOLUME_DOWN
+            _press_volume_key(vk, presses)
+    except Exception as e:
+        print(f"[STUB] set system volume -> {percent}%  (Windows-only feature: {e})")
+
+def open_task_manager() -> None:
+    """Try several ways to launch Task Manager so it works on any Windows setup."""
+    errors = []
+    try:
+        os.startfile("taskmgr.exe")
+        return
+    except Exception as e:
+        errors.append(str(e))
+    try:
+        subprocess.Popen("taskmgr.exe", shell=True)
+        return
+    except Exception as e:
+        errors.append(str(e))
+    try:
+        windir = os.environ.get("WINDIR", r"C:\Windows")
+        subprocess.Popen(os.path.join(windir, "System32", "taskmgr.exe"))
+        return
+    except Exception as e:
+        errors.append(str(e))
+    print(f"[Task Manager] Could not open Task Manager. Tried: {' | '.join(errors)}")
+
+# ------------------------------------------------
+# Background worker: talks to the local Ollama model over HTTP (/api/chat)
+class OllamaWorker(QThread):
+    chunk_received = pyqtSignal(str)   # cumulative text so far (streaming mode)
+    finished_reply  = pyqtSignal(str)   # final full text
+    error_occurred  = pyqtSignal(str)
+
+    def __init__(self, host: str, model: str, messages: list, options: dict,
+                 streaming: bool = True, json_mode: bool = False,
+                 thinking: bool = False, parent=None):
+        super().__init__(parent)
+        self.host      = host.rstrip("/")
+        self.model     = model
+        self.messages  = messages
+        self.options   = options
+        self.streaming = streaming
+        self.json_mode = json_mode
+        self.thinking  = thinking
+        self._stop     = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        if not _REQUESTS_OK:
+            self.error_occurred.emit("'requests' library missing. Install: pip install requests")
+            return
+        url = f"{self.host}/api/chat"
+        payload = {
+            "model":    self.model,
+            "messages": self.messages,
+            "stream":   self.streaming,
+            "options":  self.options,
+        }
+        if self.json_mode:
+            payload["format"] = "json"
+        if self.thinking:
+            payload["think"] = True
+        try:
+            if self.streaming:
+                full = ""
+                with requests.post(url, json=payload, stream=True, timeout=(10, 300)) as r:
+                    if r.status_code != 200:
+                        self.error_occurred.emit(f"Ollama error {r.status_code}: {r.text[:200]}")
+                        return
+                    for raw_line in r.iter_lines():
+                        if self._stop:
+                            break
+                        if not raw_line:
+                            continue
+                        try:
+                            data = json.loads(raw_line.decode("utf-8"))
+                        except Exception:
+                            continue
+                        piece = (data.get("message") or {}).get("content", "")
+                        if piece:
+                            full += piece
+                            self.chunk_received.emit(full)
+                        if data.get("done"):
+                            break
+                self.finished_reply.emit(full)
+            else:
+                r = requests.post(url, json=payload, timeout=(10, 300))
+                if r.status_code != 200:
+                    self.error_occurred.emit(f"Ollama error {r.status_code}: {r.text[:200]}")
+                    return
+                data = r.json()
+                text = (data.get("message") or {}).get("content", "")
+                self.finished_reply.emit(text)
+        except requests.exceptions.ConnectionError:
+            self.error_occurred.emit(
+                f"Ollama se connect nahi ho paaya. Check karo 'ollama serve' chal raha hai "
+                f"aur '{self.model}' pulled hai (ollama pull {self.model}).")
+        except Exception as e:
+            self.error_occurred.emit(f"LLM error: {e}")
+
+
+# ------------------------------------------------
+# Background worker: Edge-TTS speech synthesis + playback (female neural voice)
+class TTSWorker(QThread):
+    finished_speaking = pyqtSignal()
+    error_occurred    = pyqtSignal(str)
+
+    def __init__(self, text: str, voice: str = "en-US-AriaNeural",
+                 rate: str = "+0%", parent=None):
+        super().__init__(parent)
+        self.text  = text
+        self.voice = voice
+        self.rate  = rate
+
+    def run(self):
+        if not _TTS_OK:
+            self.error_occurred.emit("edge-tts / pygame missing. Install: pip install edge-tts pygame")
+            self.finished_speaking.emit()
+            return
+        out_path = os.path.join(tempfile.gettempdir(), f"isha_tts_{int(time.time()*1000)}.mp3")
+        try:
+            asyncio.run(self._synth(out_path))
+            self._play(out_path)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+        finally:
+            try:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
+            self.finished_speaking.emit()
+
+    async def _synth(self, out_path: str):
+        communicate = edge_tts.Communicate(self.text, voice=self.voice, rate=self.rate)
+        await communicate.save(out_path)
+
+    def _play(self, path: str):
+        pygame.mixer.init()
+        try:
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.1)
+        finally:
+            pygame.mixer.quit()
+
+
+# ------------------------------------------------
+# Background worker: continuous microphone listening + speech-to-text
+class MicListenerThread(QThread):
+    speech_recognized = pyqtSignal(str)
+    error_occurred     = pyqtSignal(str)
+
+    def __init__(self, language: str = "en-IN", parent=None):
+        super().__init__(parent)
+        self.language = language
+        self._running = True
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        if not _STT_OK:
+            self.error_occurred.emit(
+                "Microphone ke liye packages missing. Install: pip install SpeechRecognition PyAudio")
+            return
+        recognizer = sr.Recognizer()
+        try:
+            mic = sr.Microphone()
+        except Exception as e:
+            self.error_occurred.emit(f"Microphone not available: {e}")
+            return
+        try:
+            with mic as source:
+                try:
+                    recognizer.adjust_for_ambient_noise(source, duration=0.6)
+                except Exception:
+                    pass
+                while self._running:
+                    try:
+                        audio = recognizer.listen(source, timeout=4, phrase_time_limit=12)
+                    except sr.WaitTimeoutError:
+                        continue
+                    except Exception as e:
+                        if self._running:
+                            self.error_occurred.emit(str(e))
+                        continue
+                    if not self._running:
+                        break
+                    try:
+                        text = recognizer.recognize_google(audio, language=self.language)
+                        if text:
+                            self.speech_recognized.emit(text)
+                    except sr.UnknownValueError:
+                        continue
+                    except sr.RequestError as e:
+                        self.error_occurred.emit(f"Speech service error: {e}")
+                    except Exception as e:
+                        self.error_occurred.emit(str(e))
+        except Exception as e:
+            self.error_occurred.emit(f"Mic error: {e}")
+
+
+# ------------------------------------------------
+# UI Widgets (copied verbatim from original)
+class Star:
+    def __init__(self, max_w: int, max_h: int):
+        self.max_w = max_w; self.max_h = max_h
+        self._reset()
+    def _reset(self):
+        self.x     = random.uniform(0, self.max_w)
+        self.y     = random.uniform(0, self.max_h)
+        self.vx    = random.uniform(-0.25, 0.25)
+        self.vy    = random.uniform(-0.15, 0.15)
+        self.sz    = random.uniform(0.6, 2.2)
+        a          = random.randint(60, 190)
+        self.color = QColor(random.randint(0, 60),
+                            random.randint(160, 240),
+                            random.randint(200, 255), a)
+    def update(self):
+        self.x += self.vx; self.y += self.vy
+        if not (0 <= self.x <= self.max_w and 0 <= self.y <= self.max_h):
+            self._reset()
+
+
+class WaveformBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(60, 36)
+        self._active = False
+        self._bars   = [0.0] * 7
+        self._t = QTimer(self); self._t.timeout.connect(self._tick)
+    def set_active(self, v: bool):
+        self._active = v
+        if v: self._t.start(45)
+        else: self._t.stop(); self._bars = [0.0] * 7; self.update()
+    def _tick(self):
+        for i in range(len(self._bars)):
+            self._bars[i] = random.uniform(0.15, 1.0) if self._active else 0.0
+        self.update()
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        bw = 5; gap = 3
+        total = len(self._bars) * bw + (len(self._bars) - 1) * gap
+        x0 = (W - total) // 2
+        for i, h_frac in enumerate(self._bars):
+            bh = max(4, int(H * 0.7 * h_frac))
+            x  = x0 + i * (bw + gap)
+            y  = (H - bh) // 2
+            g  = QLinearGradient(x, y, x, y + bh)
+            g.setColorAt(0, QColor(0, 240, 255, 200))
+            g.setColorAt(1, QColor(0, 100, 200, 120))
+            p.setPen(Qt.NoPen); p.setBrush(QBrush(g))
+            p.drawRoundedRect(x, y, bw, bh, 2, 2)
+
+
+class ThinkingDots(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(40, 36)
+        self._phase = 0; self._on = False
+        self._t = QTimer(self); self._t.timeout.connect(self._tick)
+    def start(self): self._on = True;  self._t.start(200)
+    def stop(self):  self._on = False; self._t.stop();  self.update()
+    def _tick(self): self._phase = (self._phase + 1) % 4; self.update()
+    def paintEvent(self, e):
+        if not self._on: return
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        for i in range(3):
+            r = 4.5 if (self._phase == i or self._phase == 3) else 3.0
+            a = 230 if self._phase == i else 80
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 240, 255, a))
+            cx = W // 4 + i * (W // 4)
+            p.drawEllipse(QPointF(cx, H // 2), r, r)
+
+
+class MicButton(QWidget):
+    clicked = pyqtSignal()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(62, 62)
+        self.active  = False; self.hover_v = 0.0
+        self.wave_r  = [0.0, 8.0, 16.0]; self.wave_a = [0, 0, 0]
+        self._hv = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=200)
+        self._hv.valueChanged.connect(
+            lambda v: (setattr(self, "hover_v", v), self.update()))
+        self._wt = QTimer(self); self._wt.timeout.connect(self._tick_wave)
+        self.setCursor(Qt.PointingHandCursor)
+    def _tick_wave(self):
+        for i in range(3):
+            self.wave_r[i] = (self.wave_r[i] + 1.4) % 26
+            self.wave_a[i] = max(0, int(200 * (1 - self.wave_r[i] / 26)))
+        self.update()
+    def set_active(self, v: bool):
+        self.active = v
+        if v: self._wt.start(16)
+        else: self._wt.stop(); self.wave_a = [0, 0, 0]
+        self.update()
+    def enterEvent(self, e):
+        self._hv.setDirection(QVariantAnimation.Forward);  self._hv.start()
+    def leaveEvent(self, e):
+        self._hv.setDirection(QVariantAnimation.Backward); self._hv.start()
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton: self.clicked.emit()
+    def paintEvent(self, e):
+        p  = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        cx, cy, R = self.width() // 2, self.height() // 2, 23
+        if self.hover_v > 0:
+            g = QRadialGradient(cx, cy, R + 18)
+            g.setColorAt(0, QColor(0, 240, 255, int(80 * self.hover_v)))
+            g.setColorAt(1, QColor(0, 0, 0, 0))
+            p.setPen(Qt.NoPen); p.setBrush(QBrush(g))
+            p.drawEllipse(QPointF(cx, cy), R + 18, R + 18)
+        if self.active:
+            for i in range(3):
+                if self.wave_a[i] > 0:
+                    p.setPen(QPen(QColor(0, 240, 255, self.wave_a[i]), 1.2))
+                    p.setBrush(Qt.NoBrush)
+                    p.drawEllipse(QPointF(cx, cy), R + self.wave_r[i], R + self.wave_r[i])
+        g2 = QRadialGradient(cx - 7, cy - 7, R * 1.8)
+        if self.active:
+            g2.setColorAt(0, QColor(0, 220, 255)); g2.setColorAt(1, QColor(0, 80, 160))
+        else:
+            g2.setColorAt(0, QColor(20, 30, 60)); g2.setColorAt(1, QColor(10, 15, 38))
+        p.setPen(QPen(
+            QColor(0, 240, 255, 140) if self.active else QColor(0, 120, 180, 90), 1.5))
+        p.setBrush(QBrush(g2))
+        p.drawEllipse(QPointF(cx, cy), R, R)
+        col = QColor(255, 255, 255) if self.active else QColor(185, 225, 255)
+        p.setPen(QPen(col, 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        body = QPainterPath()
+        body.addRoundedRect(QRectF(cx - 5, cy - 12, 10, 14), 5, 5)
+        p.drawPath(body)
+        p.drawArc(QRectF(cx - 9, cy - 5, 18, 12), 0, -180 * 16)
+        p.drawLine(QPointF(cx, cy + 7), QPointF(cx, cy + 12))
+        p.drawLine(QPointF(cx - 4.5, cy + 12), QPointF(cx + 4.5, cy + 12))
+
+
+class SettingsButton(QWidget):
+    clicked = pyqtSignal()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(54, 54)
+        self.hover_v  = 0.0; self.rotation = 0.0
+        self._hv = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=200)
+        self._hv.valueChanged.connect(
+            lambda v: (setattr(self, "hover_v", v), self.update()))
+        self._st = QTimer(self); self._st.timeout.connect(self._spin)
+        self.setCursor(Qt.PointingHandCursor)
+    def _spin(self): self.rotation = (self.rotation + 2.5) % 360; self.update()
+    def enterEvent(self, e):
+        self._hv.setDirection(QVariantAnimation.Forward);  self._hv.start()
+        self._st.start(18)
+    def leaveEvent(self, e):
+        self._hv.setDirection(QVariantAnimation.Backward); self._hv.start()
+        self._st.stop()
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton: self.clicked.emit()
+    def paintEvent(self, e):
+        p  = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        cx, cy, R = self.width() // 2, self.height() // 2, 21
+        if self.hover_v > 0:
+            g = QRadialGradient(cx, cy, R + 14)
+            g.setColorAt(0, QColor(0, 240, 255, int(70 * self.hover_v)))
+            g.setColorAt(1, QColor(0, 0, 0, 0))
+            p.setPen(Qt.NoPen); p.setBrush(QBrush(g))
+            p.drawEllipse(QPointF(cx, cy), R + 14, R + 14)
+        g2 = QRadialGradient(cx - 5, cy - 5, R * 1.6)
+        g2.setColorAt(0, QColor(10, 20, 50)); g2.setColorAt(1, QColor(5, 10, 30))
+        p.setBrush(QBrush(g2)); p.setPen(QPen(QColor(0, 180, 255, 100), 1.2))
+        p.drawEllipse(QPointF(cx, cy), R, R)
+        p.save(); p.translate(cx, cy); p.rotate(self.rotation)
+        teeth = 8; pts = []
+        for i in range(teeth * 2):
+            a = math.radians(i * 180 / teeth)
+            r = 9.5 if i % 2 == 0 else 6.8
+            pts.append(QPointF(r * math.cos(a), r * math.sin(a)))
+        path = QPainterPath(); path.moveTo(pts[0])
+        for pt in pts[1:]: path.lineTo(pt)
+        path.closeSubpath()
+        p.setPen(QPen(QColor(0, 240, 255, 200), 1.3)); p.setBrush(Qt.NoBrush)
+        p.drawPath(path); p.drawEllipse(QPointF(0, 0), 3.5, 3.5)
+        p.restore()
+
+
+class SearchBar(QLineEdit):
+    submitted = pyqtSignal(str)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setPlaceholderText("Ask ISHA anything…")
+        self.setFixedHeight(48); self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setFrame(False); self.setFont(QFont("Segoe UI", 11))
+        self.setStyleSheet("""
+            QLineEdit {
+                background: transparent; color: #D7E1FF;
+                border: none; padding: 0 14px;
+                selection-background-color: rgba(0,240,255,80);
+            }
+        """)
+        self.setAcceptDrops(True)
+        self.dropped_file_content = None
+        self.returnPressed.connect(self._submit)
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if urls:
+                file_path = urls[0].toLocalFile()
+                if os.path.exists(file_path):
+                    ext = os.path.splitext(file_path)[1].lower()
+                    if ext in ['.txt', '.py', '.html', '.css', '.js', '.json', '.md']:
+                        try:
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                content = f.read()
+                            self.dropped_file_content = content
+                            filename = os.path.basename(file_path)
+                            self.setText(f"[File: {filename}] ")
+                            self.setFocus()
+                        except Exception as e:
+                            print(f"Error reading dropped file: {e}")
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
+    def _submit(self):
+        t = self.text().strip()
+        if t: self.submitted.emit(t); self.clear()
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(2, 8, self.width() - 4, self.height() - 16), 16, 16)
+        p.fillPath(path, QColor(0, 240, 255, 8))
+        p.setPen(QPen(QColor(0, 200, 255, 50), 1)); p.setBrush(Qt.NoBrush)
+        p.drawPath(path); p.end(); super().paintEvent(e)
+
+
+class BubbleLabel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._text    = ""; self._role = "isha"
+        self._opacity = 0.0; self._yo = 20.0
+        self._oa = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=320)
+        self._oa.setEasingCurve(QEasingCurve.OutCubic)
+        self._oa.valueChanged.connect(
+            lambda v: (setattr(self, "_opacity", v), self.update()))
+        self._ya = QVariantAnimation(self, startValue=20.0, endValue=0.0, duration=320)
+        self._ya.setEasingCurve(QEasingCurve.OutCubic)
+        self._ya.valueChanged.connect(
+            lambda v: (setattr(self, "_yo", v), self.update()))
+        self._ht = QTimer(self); self._ht.setSingleShot(True)
+        self._ht.timeout.connect(self._fade_out); self.hide()
+    def show_text(self, text: str, role: str = "isha", ms: int = 5500):
+        self._text = text; self._role = role; self._resize(); self.show()
+        self._oa.setDirection(QVariantAnimation.Forward); self._oa.start()
+        self._ya.setDirection(QVariantAnimation.Forward); self._ya.start()
+        self._ht.start(ms)
+    def begin_stream(self):
+        """Show the bubble immediately (no fade timer yet) so live tokens can be pushed in."""
+        self._ht.stop()
+        self._role = "isha"; self._text = ""
+        self._opacity = 1.0; self._yo = 0.0
+        self._resize(); self.show(); self.update()
+    def update_streaming_text(self, text: str):
+        """Update bubble contents live while the model is still generating."""
+        self._text = text
+        self._resize()
+        self.update()
+    def _fade_out(self):
+        self._oa.setDirection(QVariantAnimation.Backward)
+        self._oa.finished.connect(self.hide); self._oa.start()
+    def _resize(self):
+        fm   = QFontMetrics(QFont("Segoe UI", 11))
+        rect = fm.boundingRect(QRectF(0, 0, 520, 1000).toRect(),
+                                Qt.TextWordWrap, self._text)
+        self.setFixedSize(rect.width() + 52, rect.height() + 30)
+    def paintEvent(self, e):
+        if self._opacity <= 0: return
+        p  = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        p.setOpacity(self._opacity)
+        W, H, yo = self.width(), self.height(), int(self._yo)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, yo, W, H - yo), 14, 14)
+        if self._role == "isha":
+            fill = QLinearGradient(0, yo, W, H)
+            fill.setColorAt(0, QColor(5, 10, 25, 235))
+            fill.setColorAt(1, QColor(10, 18, 40, 235))
+            border_c = QColor(0, 240, 255, 120)
+        else:
+            fill = QLinearGradient(0, yo, W, H)
+            fill.setColorAt(0, QColor(0, 60, 80, 220))
+            fill.setColorAt(1, QColor(0, 40, 65, 215))
+            border_c = QColor(0, 240, 255, 180)
+        p.fillPath(path, QBrush(fill))
+        p.setPen(QPen(border_c, 1.4)); p.setBrush(Qt.NoBrush); p.drawPath(path)
+        sheen = QPainterPath()
+        sheen.addRoundedRect(QRectF(2, yo + 2, W - 4, 20), 12, 12)
+        p.fillPath(sheen, QColor(255, 255, 255, 7))
+        dot_c = C_NEON if self._role == "isha" else QColor(0, 240, 255, 220)
+        p.setPen(Qt.NoPen); p.setBrush(dot_c)
+        p.drawEllipse(QPointF(16, yo + (H - yo) // 2), 3.5, 3.5)
+        p.setFont(QFont("Segoe UI", 11))
+        tc = C_TEXT if self._role == "isha" else QColor(200, 245, 255)
+        p.setPen(tc)
+        p.drawText(QRectF(28, yo + 10, W - 40, H - yo - 20),
+                   Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter, self._text)
+
+
+class ChatRow(QWidget):
+    def __init__(self, text: str, role: str, ts: str = "", parent=None):
+        super().__init__(parent)
+        self._text = text; self._role = role; self._ts = ts
+        fm   = QFontMetrics(QFont("Segoe UI", 10))
+        rect = fm.boundingRect(QRectF(0, 0, 440, 9000).toRect(),
+                                Qt.TextWordWrap, text)
+        self.setFixedSize(500, rect.height() + 34)
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        bubble_path = QPainterPath()
+        if self._role == "isha":
+            bubble_path.addRoundedRect(QRectF(6, 3, W - 16, H - 6), 10, 10)
+            p.fillPath(bubble_path, QBrush(QColor(255, 255, 255, 10)))
+            p.setPen(QPen(QColor(0, 200, 255, 60), 1))
+            p.setBrush(Qt.NoBrush); p.drawPath(bubble_path)
+            bar_path = QPainterPath()
+            bar_path.addRoundedRect(QRectF(6, 3, 3, H - 6), 1.5, 1.5)
+            p.setPen(Qt.NoPen); p.setBrush(QColor(0, 240, 255, 230))
+            p.drawPath(bar_path)
+            p.setFont(QFont("Segoe UI Semibold", 8))
+            p.setPen(QColor(0, 200, 255, 200))
+            p.drawText(QRectF(16, 4, 60, 14), Qt.AlignLeft | Qt.AlignVCenter, "ISHA")
+            if self._ts:
+                p.setFont(QFont("Segoe UI", 7)); p.setPen(QColor(60, 90, 130, 160))
+                p.drawText(QRectF(W - 90, 4, 82, 14), Qt.AlignRight | Qt.AlignVCenter, self._ts)
+            p.setFont(QFont("Segoe UI", 10)); p.setPen(C_TEXT)
+            p.drawText(QRectF(16, 18, W - 28, H - 24),
+                       Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, self._text)
+        else:
+            bubble_path.addRoundedRect(QRectF(16, 3, W - 22, H - 6), 10, 10)
+            fill = QLinearGradient(0, 0, W, 0)
+            fill.setColorAt(0, QColor(0, 50, 70, 200)); fill.setColorAt(1, QColor(0, 70, 100, 210))
+            p.fillPath(bubble_path, QBrush(fill))
+            p.setPen(QPen(QColor(0, 240, 255, 120), 1))
+            p.setBrush(Qt.NoBrush); p.drawPath(bubble_path)
+            p.setFont(QFont("Segoe UI Semibold", 8))
+            p.setPen(QColor(0, 240, 255, 180))
+            p.drawText(QRectF(24, 4, 32, 14), Qt.AlignLeft | Qt.AlignVCenter, "You")
+            if self._ts:
+                p.setFont(QFont("Segoe UI", 7)); p.setPen(QColor(60, 90, 130, 160))
+                p.drawText(QRectF(W - 90, 4, 82, 14), Qt.AlignRight | Qt.AlignVCenter, self._ts)
+            p.setFont(QFont("Segoe UI", 10)); p.setPen(QColor(220, 250, 255))
+            p.drawText(QRectF(24, 18, W - 36, H - 24),
+                       Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop, self._text)
+
+
+class ChatPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedWidth(560); self.setMaximumHeight(340)
+        self._visible = False; self.setWindowOpacity(0.0)
+        self._scroll = QScrollArea(self); self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet("""
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { background: rgba(0,20,30,80); width: 4px; border-radius: 2px; }
+            QScrollBar::handle:vertical { background: rgba(0,240,255,140); border-radius: 2px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+        self._ctr = QWidget(); self._ctr.setAttribute(Qt.WA_TranslucentBackground)
+        self._lay = QVBoxLayout(self._ctr)
+        self._lay.setContentsMargins(8, 8, 8, 8); self._lay.setSpacing(5)
+        self._lay.addStretch(); self._scroll.setWidget(self._ctr)
+        root = QVBoxLayout(self); root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(self._scroll)
+        self._oa = QPropertyAnimation(self, b"windowOpacity")
+        self._oa.setDuration(280); self._oa.setEasingCurve(QEasingCurve.OutCubic)
+    def add_entry(self, text: str, role: str):
+        ts  = datetime.now().strftime("%I:%M %p")
+        row = ChatRow(text, role, ts, self._ctr)
+        self._lay.insertWidget(self._lay.count() - 1, row)
+        QTimer.singleShot(60, self._scroll_to_bottom)
+    def _scroll_to_bottom(self):
+        sb = self._scroll.verticalScrollBar()
+        sb.setValue(sb.maximum())
+    def toggle(self):
+        self._visible = not self._visible
+        self._oa.setStartValue(0.0 if self._visible else 1.0)
+        self._oa.setEndValue(1.0 if self._visible else 0.0)
+        if self._visible: self.show()
+        try: self._oa.finished.disconnect()
+        except Exception: pass
+        if not self._visible:
+            self._oa.finished.connect(self.hide)
+        self._oa.start()
+
+
+class _ToggleCard(QWidget):
+    toggled = pyqtSignal(bool)
+    def __init__(self, label: str, icon: str, icon_path: str = None, parent=None):
+        super().__init__(parent)
+        self.label = label
+        self.icon = icon
+        self.icon_path = icon_path
+        self.on = False
+        self.hov = False
+        self.setFixedSize(84, 60)
+        self.setCursor(Qt.PointingHandCursor)
+        self._load_icon()
+        
+    def _load_icon(self):
+        """Load custom icon if path is provided"""
+        self._pixmap = None
+        if self.icon_path and os.path.exists(self.icon_path):
+            pixmap = QPixmap(self.icon_path)
+            if not pixmap.isNull():
+                # Scale icon to fit nicely
+                self._pixmap = pixmap.scaled(20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                
+    def set_on(self, value: bool):
+        self.on = value
+        self.update()
+        
+    def enterEvent(self, e): 
+        self.hov = True
+        self.update()
+        
+    def leaveEvent(self, e): 
+        self.hov = False
+        self.update()
+        
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.on = not self.on
+            self.toggled.emit(self.on)
+            self.update()
+            
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, W, H), 10, 10)
+        
+        if self.on:
+            fill = QLinearGradient(0, 0, W, H)
+            fill.setColorAt(0, QColor(0, 80, 120, 220))
+            fill.setColorAt(1, QColor(0, 100, 150, 220))
+        elif self.hov:
+            fill = QLinearGradient(0, 0, W, H)
+            fill.setColorAt(0, QColor(10, 30, 50, 200))
+            fill.setColorAt(1, QColor(15, 40, 65, 200))
+        else:
+            fill = QLinearGradient(0, 0, W, H)
+            fill.setColorAt(0, QColor(6, 10, 25, 190))
+            fill.setColorAt(1, QColor(10, 16, 38, 190))
+        p.fillPath(path, QBrush(fill))
+        
+        bc = QColor(0,240,255,140) if self.on else QColor(0,120,180,60)
+        p.setPen(QPen(bc, 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+        
+        # Draw icon (either image or emoji)
+        if self._pixmap:
+            # Draw custom image icon
+            icon_x = (W - self._pixmap.width()) // 2
+            icon_y = 4
+            p.drawPixmap(icon_x, icon_y, self._pixmap)
+        else:
+            # Fallback to emoji
+            p.setFont(QFont("Segoe UI Emoji", 15))
+            p.setPen(QColor(220,245,255) if self.on else QColor(80,140,180))
+            p.drawText(QRectF(0, 2, W, 34), Qt.AlignHCenter | Qt.AlignVCenter, self.icon)
+        
+        # Draw label
+        p.setFont(QFont("Segoe UI", 7))
+        p.setPen(QColor(190,240,255) if self.on else QColor(80,130,170))
+        p.drawText(QRectF(0, H - 18, W, 16), Qt.AlignHCenter | Qt.AlignVCenter, self.label)
+
+
+class _ActionCard(QWidget):
+    clicked = pyqtSignal()
+    def __init__(self, label: str, icon: str, icon_path: str = None, parent=None):
+        super().__init__(parent)
+        self.label = label
+        self.icon = icon  # Keep for emoji fallback
+        self.icon_path = icon_path  # Path to custom image
+        self.hov = False
+        self.setFixedHeight(36)
+        self.setCursor(Qt.PointingHandCursor)
+        self._load_icon()
+        
+    def _load_icon(self):
+        """Load custom icon if path is provided"""
+        self._pixmap = None
+        if self.icon_path and os.path.exists(self.icon_path):
+            pixmap = QPixmap(self.icon_path)
+            if not pixmap.isNull():
+                # Scale icon to fit nicely
+                self._pixmap = pixmap.scaled(18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                
+    def enterEvent(self, e): 
+        self.hov = True
+        self.update()
+        
+    def leaveEvent(self, e): 
+        self.hov = False
+        self.update()
+        
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton: 
+            self.clicked.emit()
+            
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        
+        if self.hov:
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(0, 1, W, H - 2), 8, 8)
+            p.fillPath(path, QBrush(QColor(0, 40, 60, 190)))
+        
+        # Draw icon (either image or emoji)
+        if self._pixmap:
+            # Draw custom image icon
+            icon_x = 12
+            icon_y = (H - self._pixmap.height()) // 2
+            p.drawPixmap(icon_x, icon_y, self._pixmap)
+            text_x = 38  # Start text after icon + spacing
+        else:
+            # Fallback to emoji
+            p.setFont(QFont("Segoe UI Emoji", 12))
+            p.setPen(QColor(0, 200, 240))
+            p.drawText(QRectF(10, 0, 26, H), Qt.AlignLeft | Qt.AlignVCenter, self.icon)
+            text_x = 40
+        
+        # Draw label text
+        p.setFont(QFont("Segoe UI", 10))
+        p.setPen(QColor(190, 235, 255) if self.hov else QColor(120, 175, 215))
+        p.drawText(QRectF(text_x, 0, W - text_x - 8, H), 
+                   Qt.AlignLeft | Qt.AlignVCenter, self.label)
+
+
+class _LauncherPopup(QWidget):
+    def __init__(self, title: str, items: list, parent=None):
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(300, 380)
+        self._items = items
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12); root.setSpacing(7)
+        hdr_row = QHBoxLayout()
+        hdr = QLabel(title)
+        hdr.setFont(QFont("Segoe UI Semibold", 10))
+        hdr.setStyleSheet("color: #00F0FF; background: transparent;")
+        hdr_row.addWidget(hdr, 1)
+        close_btn_lp = QPushButton("✕")
+        close_btn_lp.setFixedSize(22, 22)
+        close_btn_lp.setStyleSheet("""
+            QPushButton { background: rgba(60,0,0,180); color: #FF4040;
+                border: 1px solid rgba(255,60,60,70); border-radius: 6px;
+                font-size: 9pt; font-weight: bold; }
+            QPushButton:hover { background: rgba(100,0,0,220); color: #FFFFFF; border: 1px solid rgb(255,80,80); }
+            QPushButton:pressed { background: rgba(150,0,0,240); }
+        """)
+        close_btn_lp.setCursor(Qt.PointingHandCursor)
+        close_btn_lp.clicked.connect(self._close)
+        hdr_row.addWidget(close_btn_lp)
+        root.addLayout(hdr_row)
+        self._flt = QLineEdit()
+        self._flt.setPlaceholderText("Filter…"); self._flt.setFixedHeight(28)
+        self._flt.setStyleSheet("""
+            QLineEdit { background: rgba(0,20,30,210); color: #C0E8FF;
+                border: 1px solid rgba(0,200,255,80); border-radius: 6px;
+                padding: 0 8px; font-size: 10px; }
+        """)
+        self._flt.textChanged.connect(self._filter); root.addWidget(self._flt)
+        self._lst = QListWidget()
+        self._lst.setWordWrap(True)
+        self._lst.setStyleSheet("""
+            QListWidget { background: transparent; border: none;
+                color: #B0D8F0; font-size: 10px; outline: none; }
+            QListWidget::item { padding: 4px 8px; border-radius: 5px; }
+            QListWidget::item:hover { background: rgba(0,60,90,170); }
+            QListWidget::item:selected { background: rgba(0,100,150,180); color: white; }
+            QScrollBar:vertical { background: rgba(0,10,20,80); width: 4px; border-radius: 2px; }
+            QScrollBar::handle:vertical { background: rgba(0,240,255,140); border-radius: 2px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+        for name, _ in items:
+            self._lst.addItem(name)
+        self._lst.itemClicked.connect(self._on_click)
+        root.addWidget(self._lst)
+        self._anim = QPropertyAnimation(self, b"windowOpacity")
+        self._anim.setDuration(200); self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.setWindowOpacity(0.0)
+    def _filter(self, text: str):
+        tl = text.lower()
+        for i in range(self._lst.count()):
+            item = self._lst.item(i)
+            item.setHidden(tl != "" and tl not in item.text().lower())
+    def _on_click(self, item: QListWidgetItem):
+        idx = self._lst.row(item); _, cmd = self._items[idx]
+        _popen_silent(cmd); self._close()
+    def show_popup(self):
+        self.setWindowOpacity(0.0); self.show()
+        self._flt.clear(); self._filter("")
+        self._anim.setStartValue(0.0); self._anim.setEndValue(1.0)
+        try: self._anim.finished.disconnect()
+        except Exception: pass
+        self._anim.start()
+    def _close(self):
+        self._anim.setStartValue(self.windowOpacity()); self._anim.setEndValue(0.0)
+        try: self._anim.finished.disconnect()
+        except Exception: pass
+        self._anim.finished.connect(self.hide); self._anim.start()
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, W, H), 14, 14)
+        bg = QLinearGradient(0, 0, W // 2, H)
+        bg.setColorAt(0, QColor(4, 8, 20, 252)); bg.setColorAt(1, QColor(8, 14, 35, 252))
+        p.fillPath(path, QBrush(bg))
+        p.setPen(QPen(QColor(0, 240, 255, 80), 1.5)); p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+    def mousePressEvent(self, e):
+        if not self.rect().contains(e.pos()): self._close()
+
+
+class AboutISHAWindow(QWidget):
+    """Small 'About ISHA' popup: name, full form, credit."""
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(300, 220)
+        self._drag_pos = None
+        self._build()
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 14, 18, 16)
+        root.setSpacing(6)
+
+        hdr_row = QHBoxLayout()
+        hdr_row.addStretch()
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setStyleSheet("""
+            QPushButton { background: rgba(60,0,0,180); color: #FF4040;
+                border: 1px solid rgba(255,60,60,70); border-radius: 6px;
+                font-size: 9pt; font-weight: bold; }
+            QPushButton:hover { background: rgba(100,0,0,220); color: #FFFFFF; border: 1px solid rgb(255,80,80); }
+            QPushButton:pressed { background: rgba(150,0,0,240); }
+        """)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.clicked.connect(self.close)
+        hdr_row.addWidget(close_btn)
+        root.addLayout(hdr_row)
+
+        root.addStretch()
+
+        name_lbl = QLabel("ISHA")
+        name_lbl.setAlignment(Qt.AlignCenter)
+        name_lbl.setFont(QFont("Segoe UI", 28, QFont.Bold))
+        name_lbl.setStyleSheet("color: #00F0FF; background: transparent;")
+        root.addWidget(name_lbl)
+
+        full_form_lbl = QLabel("Intelligent System for Human Assistance")
+        full_form_lbl.setAlignment(Qt.AlignCenter)
+        full_form_lbl.setWordWrap(True)
+        full_form_lbl.setFont(QFont("Segoe UI", 10))
+        full_form_lbl.setStyleSheet("color: #B0D8F0; background: transparent;")
+        root.addWidget(full_form_lbl)
+
+        root.addStretch()
+
+        credit_lbl = QLabel("Powered by @Amit Vishawakram")
+        credit_lbl.setAlignment(Qt.AlignCenter)
+        credit_lbl.setFont(QFont("Segoe UI", 9))
+        credit_lbl.setStyleSheet("color: #3C6488; background: transparent;")
+        root.addWidget(credit_lbl)
+
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, W, H), 14, 14)
+        bg = QLinearGradient(0, 0, W // 2, H)
+        bg.setColorAt(0, QColor(4, 8, 20, 252)); bg.setColorAt(1, QColor(8, 14, 35, 252))
+        p.fillPath(path, QBrush(bg))
+        p.setPen(QPen(QColor(0, 240, 255, 90), 1.5)); p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_pos = e.globalPos() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.LeftButton and self._drag_pos:
+            self.move(e.globalPos() - self._drag_pos)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+
+
+class QuickSettingsPopup(QWidget):
+    _CELL_W = 126
+    _CELL_H = 64
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.main_window   = parent          # FIX: was never set before -> AttributeError on toggle
+        self._is_open      = False
+        self._about_popup  = None
+        self._anim = QPropertyAnimation(self, b"windowOpacity")
+        self._anim.setDuration(220); self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.setWindowOpacity(0.0)
+        self._drag_pos = None   # for dragging
+        self._build()
+        self.adjustSize()
+    
+    def toggle(self, pos: QPoint):
+        if self._is_open: self._do_hide()
+        else:             self._do_show(pos)
+    
+    def _do_show(self, pos: QPoint):
+        self.move(pos); self.setWindowOpacity(0.0); self.show()
+        if self.main_window is not None:
+            self.update_stats(getattr(self.main_window, "_latest_stats", {}))
+        self._anim.stop()
+        try: self._anim.finished.disconnect()
+        except Exception: pass
+        self._anim.setStartValue(0.0); self._anim.setEndValue(1.0); self._anim.start()
+        self._is_open = True
+    
+    def _do_hide(self):
+        self._anim.stop()
+        try: self._anim.finished.disconnect()
+        except Exception: pass
+        self._anim.setStartValue(self.windowOpacity()); self._anim.setEndValue(0.0)
+        self._anim.finished.connect(self._after_hide); self._anim.start()
+    
+    def _after_hide(self):
+        self.hide(); self._is_open = False
+        try: self._anim.finished.disconnect(self._after_hide)
+        except Exception: pass
+    
+    def _build(self):
+        # Define the info icon path
+        info_icon_path = r"C:\Users\Ak\Desktop\ISHA V5\icon\info.png"
+        info_icon_path1 = r"C:\Users\Ak\Desktop\ISHA V5\icon\task.png"
+        info_icon_path2 = r"C:\Users\Ak\Desktop\ISHA V5\icon\mute.png"
+        info_icon_path3 = r"C:\Users\Ak\Desktop\ISHA V5\icon\generative-image.png"
+        info_icon_path4 = r"C:\Users\Ak\Desktop\ISHA V5\icon\intuitive.png"
+        info_icon_path5 = r"C:\Users\Ak\Desktop\ISHA V5\icon\configuration.png"
+        info_icon_path6 = r"C:\Users\Ak\Desktop\ISHA V5\icon\medical-report.png"
+        info_icon_path7 = r"C:\Users\Ak\Desktop\ISHA V5\icon\chat.png"
+        
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 16)
+        root.setSpacing(9)
+        
+        hdr = QLabel("Quick Settings")
+        hdr.setFont(QFont("Segoe UI Semibold", 11))
+        hdr.setStyleSheet("color: #00F0FF; background: transparent;")
+        root.addWidget(hdr, 0, Qt.AlignCenter)
+        
+        sep_top = QFrame(); sep_top.setFixedHeight(1)
+        sep_top.setStyleSheet("background: rgba(0,200,255,40);")
+        root.addWidget(sep_top)
+        
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        grid.setContentsMargins(0, 0, 0, 0)
+        cw, ch = self._CELL_W, self._CELL_H
+        
+        # All toggle cards with info icon
+        self._t_mute = _ToggleCard("Mute", "🔇", info_icon_path2)
+        self._t_display = _ToggleCard("Ask image", "🖥", info_icon_path3)
+        self._t_mute.setFixedSize(cw, ch)
+        self._t_display.setFixedSize(cw, ch)
+        self._t_mute.toggled.connect(self._on_mute_toggled)
+        self._t_display.toggled.connect(lambda on: print(f"UI: Display toggled {on}"))
+        grid.addWidget(self._t_mute, 0, 0)
+        grid.addWidget(self._t_display, 0, 1)
+
+        self._t_hand_control = _ToggleCard("Hand", "🤚", info_icon_path4)
+        self._t_hand_control.setFixedSize(cw, ch)
+        self._t_hand_control.toggled.connect(self._on_hand_control_toggled)
+        self._t_model_settings = _ToggleCard("Configurations", "🤖", info_icon_path5)
+        self._t_model_settings.setFixedSize(cw, ch)
+        self._t_model_settings.toggled.connect(self._on_model_settings_toggled)
+        grid.addWidget(self._t_hand_control, 1, 0)
+        grid.addWidget(self._t_model_settings, 1, 1)
+
+        # History and Comm Dock side by side
+        self._t_chat_history = _ToggleCard("History", "💬", info_icon_path6)
+        self._t_chat_history.setFixedSize(cw, ch)
+        self._t_chat_history.toggled.connect(self._on_history_toggled)
+        grid.addWidget(self._t_chat_history, 2, 0)
+
+        self._t_comm_dock = _ToggleCard("Comm Dock", "📡", info_icon_path7)
+        self._t_comm_dock.setFixedSize(cw, ch)
+        self._t_comm_dock.toggled.connect(self._on_comm_dock_toggled)
+        grid.addWidget(self._t_comm_dock, 2, 1)
+
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        root.addLayout(grid)
+
+        sep_mid = QFrame(); sep_mid.setFixedHeight(1)
+        sep_mid.setStyleSheet("background: rgba(0,200,255,40);")
+        root.addWidget(sep_mid)
+
+        self._stats_label = QLabel("CPU -- % · RAM -- % · Battery -- %")
+        self._stats_label.setFont(QFont("Segoe UI", 9))
+        self._stats_label.setStyleSheet("color: #00C8FF; background: transparent;")
+        self._stats_label.setAlignment(Qt.AlignCenter)
+        root.addWidget(self._stats_label)
+
+        sep_stats = QFrame(); sep_stats.setFixedHeight(1)
+        sep_stats.setStyleSheet("background: rgba(0,200,255,40);")
+        root.addWidget(sep_stats)
+
+        vl = QLabel("Volume")
+        vl.setFont(QFont("Segoe UI", 9))
+        vl.setStyleSheet("color: #006080; background: transparent;")
+        root.addWidget(vl)
+        self._vol = QSlider(Qt.Horizontal)
+        self._vol.setRange(0, 100); self._vol.setValue(50); self._vol.setFixedHeight(22)
+        self._last_vol = 50   # tracks previous slider value to compute live +/- delta
+        self._vol.setStyleSheet("""
+            QSlider::groove:horizontal { height:6px; background:rgba(0,40,60,180); border-radius:3px; }
+            QSlider::handle:horizontal { width:16px; height:16px;
+                background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #00F0FF,stop:1 #0080CC);
+                border-radius:8px; margin:-5px 0; }
+            QSlider::sub-page:horizontal { background:qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                stop:0 #005080,stop:1 #00C0E0); border-radius:3px; }
+        """)
+        self._vol.valueChanged.connect(self._on_volume_changed)
+        root.addWidget(self._vol)
+
+        sep_bot = QFrame(); sep_bot.setFixedHeight(1)
+        sep_bot.setStyleSheet("background: rgba(0,200,255,40);")
+        root.addWidget(sep_bot)
+
+        # Action cards with info icon
+        apps_card = _ActionCard("Task Manager", "🚀", info_icon_path1)
+        stgs_card = _ActionCard("About ISHA", "⚙️", info_icon_path)
+        apps_card.clicked.connect(self._open_task_manager)
+        stgs_card.clicked.connect(self._show_about_isha)
+        root.addWidget(apps_card)
+        root.addWidget(stgs_card)
+
+        sep3 = QFrame(); sep3.setFixedHeight(1)
+        sep3.setStyleSheet("background: rgba(0,200,255,40);")
+        root.addWidget(sep3)
+
+    def _on_comm_dock_toggled(self, on: bool):
+        if self.main_window:
+            self.main_window.toggle_comm_dock(on)
+
+    def _on_model_settings_toggled(self, on: bool):
+        if self.main_window:
+            self.main_window.toggle_config_dialog(on)
+
+    def _on_hand_control_toggled(self, on: bool):
+        if self.main_window:
+            self.main_window.toggle_hand_control(on)
+
+    def _on_history_toggled(self, on: bool):
+        if self.main_window:
+            self.main_window.toggle_history_window(on)
+
+    def _on_mute_toggled(self, on: bool):
+        set_system_mute(on)
+        if self.main_window:
+            self.main_window.respond("Audio muted." if on else "Audio unmuted.", "isha")
+
+    def _on_volume_changed(self, v: int):
+        set_system_volume(v, self._last_vol)
+        self._last_vol = v
+
+    def update_stats(self, stats: dict):
+        if not stats:
+            return
+        cpu = stats.get("cpu_percent")
+        ram = stats.get("ram_percent")
+        batt = stats.get("battery_percent")
+        parts = []
+        if cpu is not None: parts.append(f"CPU {cpu:.0f}%")
+        if ram is not None: parts.append(f"RAM {ram:.0f}%")
+        if batt is not None: parts.append(f"Battery {batt:.0f}%")
+        self._stats_label.setText(" · ".join(parts) if parts else "Stats unavailable")
+
+    def _open_task_manager(self):
+        open_task_manager()
+
+    def _show_about_isha(self):
+        if not self._about_popup:
+            self._about_popup = AboutISHAWindow(self)
+        btn_g = self.mapToGlobal(QPoint(0, 0))
+        self._about_popup.move(btn_g.x() - 300, btn_g.y())
+        self._about_popup.show()
+        self._about_popup.raise_()
+
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, W, H), 14, 14)
+        bg = QLinearGradient(0, 0, W // 2, H)
+        bg.setColorAt(0, QColor(4,  8, 20, 252))
+        bg.setColorAt(1, QColor(8, 14, 35, 252))
+        p.fillPath(path, QBrush(bg))
+        p.setPen(QPen(QColor(0, 240, 255, 80), 1.5))
+        p.setBrush(Qt.NoBrush); p.drawPath(path)
+        pen = QPen(QColor(0, 200, 255, 60), 1.2); p.setPen(pen)
+        for (x, y, dx, dy) in [(1,1,10,0),(1,1,0,10),(W-1,1,-10,0),(W-1,1,0,10),
+                                 (1,H-1,10,0),(1,H-1,0,-10),(W-1,H-1,-10,0),(W-1,H-1,0,-10)]:
+            p.drawLine(x, y, x + dx, y + dy)
+
+    # ---- Dragging support ----
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_pos = e.globalPos() - self.frameGeometry().topLeft()
+        else:
+            super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.LeftButton and self._drag_pos:
+            self.move(e.globalPos() - self._drag_pos)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+
+
+class CommDockWindow(QWidget):
+    # signal emitted when the window is closed (by user)
+    closed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(540, 340)
+        self._drag_pos = None
+        self._build()
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(6)
+        self._log_area = QTextEdit()
+        self._log_area.setReadOnly(True)
+        self._log_area.setFont(QFont("Consolas", 8))
+        self._log_area.setStyleSheet("""
+            QTextEdit {
+                background: rgba(2, 6, 15, 230); color: #58A8C0;
+                border: 1px solid rgba(0,160,200,60); border-radius: 8px;
+                padding: 6px;
+            }
+            QScrollBar:vertical {
+                background: rgba(0,10,20,80); width: 4px; border-radius: 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(0,200,255,100); border-radius: 2px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+        hdr_row = QHBoxLayout()
+        title = QLabel("● ISHA Communication Dock (UI only)")
+        title.setFont(QFont("Segoe UI Semibold", 10))
+        title.setStyleSheet("color: #00F0FF; background: transparent;")
+        hdr_row.addWidget(title)
+        hdr_row.addStretch()
+        clear_btn = QPushButton("Clear")
+        clear_btn.setFixedSize(52, 22)
+        clear_btn.setStyleSheet("""
+            QPushButton { background: rgba(0,40,60,200); color: #00C8E8;
+                border: 1px solid rgba(0,180,240,60); border-radius: 5px; font-size: 8pt; }
+            QPushButton:hover { background: rgba(0,60,90,220); border: 1px solid rgb(0,240,255); color: #FFFFFF; }
+            QPushButton:pressed { background: rgba(0,90,130,240); }
+        """)
+        clear_btn.clicked.connect(self._log_area.clear)
+        hdr_row.addWidget(clear_btn)
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setStyleSheet("""
+            QPushButton { background: rgba(60,0,0,180); color: #FF4040;
+                border: 1px solid rgba(255,60,60,60); border-radius: 5px; font-size: 9pt; }
+            QPushButton:hover { background: rgba(100,0,0,220); border: 1px solid rgb(255,80,80); color: #FFFFFF; }
+            QPushButton:pressed { background: rgba(150,0,0,240); }
+        """)
+        close_btn.clicked.connect(self.close)  # will trigger closeEvent
+        hdr_row.addWidget(close_btn)
+        root.addLayout(hdr_row)
+        root.addWidget(self._log_area)
+        self._log_area.append("=== ISHA v13 UI-only Demo ===")
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        super().closeEvent(event)
+
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, W, H), 14, 14)
+        bg = QLinearGradient(0, 0, W, H)
+        bg.setColorAt(0, QColor(3, 6, 16, 252))
+        bg.setColorAt(1, QColor(6, 10, 24, 252))
+        p.fillPath(path, QBrush(bg))
+        p.setPen(QPen(QColor(0, 200, 255, 80), 1.5))
+        p.setBrush(Qt.NoBrush); p.drawPath(path)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_pos = e.globalPos() - self.frameGeometry().topLeft()
+        else:
+            super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.LeftButton and self._drag_pos:
+            self.move(e.globalPos() - self._drag_pos)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+
+
+class HistoryWindow(QWidget):
+    """Day-by-day chat history viewer, with a 'Delete All History' option."""
+    closed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(560, 400)
+        self._drag_pos = None
+        self._build()
+        self.refresh()
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        hdr_row = QHBoxLayout()
+        title = QLabel("● ISHA Chat History")
+        title.setFont(QFont("Segoe UI Semibold", 10))
+        title.setStyleSheet("color: #00F0FF; background: transparent;")
+        hdr_row.addWidget(title)
+        hdr_row.addStretch()
+
+        del_btn = QPushButton("Delete All History")
+        del_btn.setFixedHeight(24)
+        del_btn.setStyleSheet("""
+            QPushButton { background: rgba(60,0,0,180); color: #FF6060;
+                border: 1px solid rgba(255,60,60,70); border-radius: 6px;
+                font-size: 8pt; padding: 0 10px; }
+            QPushButton:hover { background: rgba(100,0,0,220); color: #FFFFFF; border: 1px solid rgb(255,80,80); }
+            QPushButton:pressed { background: rgba(150,0,0,240); }
+        """)
+        del_btn.setCursor(Qt.PointingHandCursor)
+        del_btn.clicked.connect(self._delete_all)
+        hdr_row.addWidget(del_btn)
+
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setStyleSheet("""
+            QPushButton { background: rgba(60,0,0,180); color: #FF4040;
+                border: 1px solid rgba(255,60,60,60); border-radius: 5px; font-size: 9pt; }
+            QPushButton:hover { background: rgba(100,0,0,220); border: 1px solid rgb(255,80,80); color: #FFFFFF; }
+            QPushButton:pressed { background: rgba(150,0,0,240); }
+        """)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.clicked.connect(self.close)
+        hdr_row.addWidget(close_btn)
+        root.addLayout(hdr_row)
+
+        body = QSplitter(Qt.Horizontal)
+        body.setStyleSheet("QSplitter::handle { background: rgba(0,200,255,40); }")
+
+        self._date_list = QListWidget()
+        self._date_list.setFixedWidth(150)
+        self._date_list.setStyleSheet("""
+            QListWidget { background: rgba(2,6,15,230); border: 1px solid rgba(0,160,200,60);
+                border-radius: 8px; color: #B0D8F0; font-size: 10px; outline: none; }
+            QListWidget::item { padding: 6px 8px; border-radius: 5px; }
+            QListWidget::item:hover { background: rgba(0,60,90,170); }
+            QListWidget::item:selected { background: rgba(0,100,150,180); color: white; }
+            QScrollBar:vertical { background: rgba(0,10,20,80); width: 4px; border-radius: 2px; }
+            QScrollBar::handle:vertical { background: rgba(0,200,255,100); border-radius: 2px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+        self._date_list.itemClicked.connect(self._show_day)
+        body.addWidget(self._date_list)
+
+        self._day_view = QTextEdit()
+        self._day_view.setReadOnly(True)
+        self._day_view.setFont(QFont("Consolas", 8))
+        self._day_view.setStyleSheet("""
+            QTextEdit { background: rgba(2, 6, 15, 230); color: #58A8C0;
+                border: 1px solid rgba(0,160,200,60); border-radius: 8px; padding: 6px; }
+            QScrollBar:vertical { background: rgba(0,10,20,80); width: 4px; border-radius: 2px; }
+            QScrollBar::handle:vertical { background: rgba(0,200,255,100); border-radius: 2px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+        body.addWidget(self._day_view)
+        body.setSizes([150, 400])
+        root.addWidget(body)
+
+    def refresh(self):
+        """Reload dates + entries from disk."""
+        self._date_list.clear()
+        data = load_history()
+        for date_key in sorted(data.keys(), reverse=True):
+            self._date_list.addItem(date_key)
+        self._day_view.clear()
+        if self._date_list.count():
+            self._date_list.setCurrentRow(0)
+            self._show_day(self._date_list.currentItem())
+        else:
+            self._day_view.setPlainText("No chat history yet.")
+
+    def _show_day(self, item):
+        if item is None:
+            return
+        date_key = item.text()
+        entries = load_history().get(date_key, [])
+        self._day_view.clear()
+        for entry in entries:
+            who = "ISHA" if entry.get("role") == "isha" else "You"
+            self._day_view.append(f"[{entry.get('time', '')}] {who}: {entry.get('text', '')}")
+
+    def _delete_all(self):
+        confirm = QMessageBox.question(
+            self, "Delete All History",
+            "Are you sure you want to permanently delete all chat history?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if confirm == QMessageBox.Yes:
+            delete_all_history()
+            self.refresh()
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        super().closeEvent(event)
+
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, W, H), 14, 14)
+        bg = QLinearGradient(0, 0, W, H)
+        bg.setColorAt(0, QColor(3, 6, 16, 252))
+        bg.setColorAt(1, QColor(6, 10, 24, 252))
+        p.fillPath(path, QBrush(bg))
+        p.setPen(QPen(QColor(0, 200, 255, 80), 1.5))
+        p.setBrush(Qt.NoBrush); p.drawPath(path)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_pos = e.globalPos() - self.frameGeometry().topLeft()
+        else:
+            super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.LeftButton and self._drag_pos:
+            self.move(e.globalPos() - self._drag_pos)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+
+
+# ------------------------------------------------
+# Model / Voice configuration window (opened from Quick Settings -> Configurations)
+class ConfigWindow(QWidget):
+    """Popup used to configure the local Ollama model + Edge-TTS voice.
+    Settings are persisted to isha_config.json so they survive restarts."""
+    closed = pyqtSignal()
+    saved  = pyqtSignal(dict)
+
+    _INPUT_QSS = """
+        QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
+            background: rgba(0,20,30,210); color: #C0E8FF;
+            border: 1px solid rgba(0,200,255,80); border-radius: 6px;
+            padding: 3px 8px; font-size: 10px;
+        }
+        QComboBox QAbstractItemView {
+            background: rgba(4,8,20,250); color: #C0E8FF;
+            selection-background-color: rgba(0,100,150,200);
+        }
+        QCheckBox { color: #B0D8F0; font-size: 10px; background: transparent; }
+    """
+
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(420, 580)
+        self._drag_pos = None
+        self.cfg = dict(cfg)
+        self._build()
+
+    # ---- small layout helpers ----
+    def _section(self, root, title):
+        lbl = QLabel(title)
+        lbl.setFont(QFont("Segoe UI Semibold", 9))
+        lbl.setStyleSheet("color: #00F0FF; background: transparent; margin-top: 6px;")
+        root.addWidget(lbl)
+        sep = QFrame(); sep.setFixedHeight(1)
+        sep.setStyleSheet("background: rgba(0,200,255,40);")
+        root.addWidget(sep)
+
+    def _row(self, root, label_text, widget):
+        row = QHBoxLayout()
+        lbl = QLabel(label_text)
+        lbl.setFont(QFont("Segoe UI", 9))
+        lbl.setStyleSheet("color: #B0D8F0; background: transparent;")
+        lbl.setFixedWidth(132)
+        row.addWidget(lbl)
+        row.addWidget(widget, 1)
+        root.addLayout(row)
+
+    def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        hdr_row = QHBoxLayout()
+        hdr_row.setContentsMargins(16, 12, 12, 4)
+        title = QLabel("● ISHA — Model Configurations")
+        title.setFont(QFont("Segoe UI Semibold", 10))
+        title.setStyleSheet("color: #00F0FF; background: transparent;")
+        hdr_row.addWidget(title, 1)
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setStyleSheet("""
+            QPushButton { background: rgba(60,0,0,180); color: #FF4040;
+                border: 1px solid rgba(255,60,60,70); border-radius: 6px;
+                font-size: 9pt; font-weight: bold; }
+            QPushButton:hover { background: rgba(100,0,0,220); color: #FFFFFF; border: 1px solid rgb(255,80,80); }
+            QPushButton:pressed { background: rgba(150,0,0,240); }
+        """)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.clicked.connect(self.close)
+        hdr_row.addWidget(close_btn)
+        outer.addLayout(hdr_row)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("""
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { background: rgba(0,20,30,80); width: 4px; border-radius: 2px; }
+            QScrollBar::handle:vertical { background: rgba(0,240,255,140); border-radius: 2px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+        body = QWidget(); body.setAttribute(Qt.WA_TranslucentBackground)
+        body.setStyleSheet(self._INPUT_QSS)
+        root = QVBoxLayout(body)
+        root.setContentsMargins(16, 4, 16, 12); root.setSpacing(6)
+
+        c = self.cfg
+
+        # ---- Model & Connection ----
+        self._section(root, "Model & Connection")
+        self._f_model = QLineEdit(str(c.get("model", "qwen2.5:1.5b")))
+        self._row(root, "Model name", self._f_model)
+        self._f_host = QLineEdit(str(c.get("ollama_host", "http://localhost:11434")))
+        self._row(root, "Ollama host", self._f_host)
+
+        # ---- 1. Hardware & Speed ----
+        self._section(root, "1. Hardware & Speed")
+        self._f_gpu = QSpinBox(); self._f_gpu.setRange(-1, 999)
+        self._f_gpu.setValue(int(c.get("gpu_layers", -1)))
+        self._f_gpu.setToolTip("-1 = Ollama decide karega, 0 = CPU only, N = GPU par layers")
+        self._row(root, "GPU Layers", self._f_gpu)
+
+        self._f_threads = QSpinBox(); self._f_threads.setRange(0, 128)
+        self._f_threads.setValue(int(c.get("cpu_threads", 0)))
+        self._f_threads.setToolTip("0 = auto")
+        self._row(root, "CPU Threads", self._f_threads)
+
+        self._f_batch = QSpinBox(); self._f_batch.setRange(1, 8192)
+        self._f_batch.setValue(int(c.get("batch_size", 512)))
+        self._row(root, "Batch Size", self._f_batch)
+
+        # ---- 2. Memory & Chatting ----
+        self._section(root, "2. Memory & Chatting")
+        self._f_ctx = QSpinBox(); self._f_ctx.setRange(256, 131072); self._f_ctx.setSingleStep(256)
+        self._f_ctx.setValue(int(c.get("context_length", 4096)))
+        self._row(root, "Context Length", self._f_ctx)
+
+        self._f_sysprompt = QTextEdit(str(c.get("system_prompt", "")))
+        self._f_sysprompt.setFixedHeight(56)
+        self._row(root, "System Prompt", self._f_sysprompt)
+
+        stop_val = c.get("stop_tokens", [])
+        stop_str = ", ".join(stop_val) if isinstance(stop_val, list) else str(stop_val)
+        self._f_stop = QLineEdit(stop_str)
+        self._f_stop.setPlaceholderText("comma se alag karo, e.g. </s>, User:")
+        self._row(root, "Stop Tokens", self._f_stop)
+
+        # ---- 3. Creativity & sampling ----
+        self._section(root, "3. Creativity & Sampling")
+        self._f_temp = QDoubleSpinBox(); self._f_temp.setRange(0.0, 2.0); self._f_temp.setSingleStep(0.05)
+        self._f_temp.setValue(float(c.get("temperature", 0.8)))
+        self._row(root, "Temperature", self._f_temp)
+
+        self._f_topp = QDoubleSpinBox(); self._f_topp.setRange(0.0, 1.0); self._f_topp.setSingleStep(0.05)
+        self._f_topp.setValue(float(c.get("top_p", 0.9)))
+        self._row(root, "Top P", self._f_topp)
+
+        self._f_topk = QSpinBox(); self._f_topk.setRange(0, 500)
+        self._f_topk.setValue(int(c.get("top_k", 40)))
+        self._row(root, "Top K", self._f_topk)
+
+        self._f_minp = QDoubleSpinBox(); self._f_minp.setRange(0.0, 1.0); self._f_minp.setSingleStep(0.01)
+        self._f_minp.setValue(float(c.get("min_p", 0.0)))
+        self._row(root, "Min P", self._f_minp)
+
+        self._f_repeat = QDoubleSpinBox(); self._f_repeat.setRange(0.0, 3.0); self._f_repeat.setSingleStep(0.05)
+        self._f_repeat.setValue(float(c.get("repeat_penalty", 1.1)))
+        self._row(root, "Repeat Penalty", self._f_repeat)
+
+        self._f_presence = QDoubleSpinBox(); self._f_presence.setRange(-2.0, 2.0); self._f_presence.setSingleStep(0.1)
+        self._f_presence.setValue(float(c.get("presence_penalty", 0.0)))
+        self._row(root, "Presence Penalty", self._f_presence)
+
+        self._f_frequency = QDoubleSpinBox(); self._f_frequency.setRange(-2.0, 2.0); self._f_frequency.setSingleStep(0.1)
+        self._f_frequency.setValue(float(c.get("frequency_penalty", 0.0)))
+        self._row(root, "Frequency Penalty", self._f_frequency)
+
+        # ---- 4. Output & Format ----
+        self._section(root, "4. Output & Format")
+        self._f_json = QCheckBox("JSON Mode (sirf JSON reply)")
+        self._f_json.setChecked(bool(c.get("json_mode", False)))
+        root.addWidget(self._f_json)
+
+        self._f_stream = QCheckBox("Streaming (word-by-word)")
+        self._f_stream.setChecked(bool(c.get("streaming", True)))
+        root.addWidget(self._f_stream)
+
+        self._f_thinking = QCheckBox("Thinking Mode (reasoning models)")
+        self._f_thinking.setChecked(bool(c.get("thinking_mode", False)))
+        root.addWidget(self._f_thinking)
+
+        self._f_seed = QSpinBox(); self._f_seed.setRange(-1, 2_147_483_647)
+        self._f_seed.setValue(int(c.get("seed", -1)))
+        self._f_seed.setToolTip("-1 = random, fixed number = same output har baar")
+        self._row(root, "Seed", self._f_seed)
+
+        # ---- Voice (Edge-TTS) ----
+        self._section(root, "Voice (Edge-TTS)")
+        self._f_tts_on = QCheckBox("Har reply bolke sunao")
+        self._f_tts_on.setChecked(bool(c.get("tts_enabled", True)))
+        root.addWidget(self._f_tts_on)
+
+        self._f_voice = QComboBox()
+        self._voice_options = [
+            ("en-US-AriaNeural",   "English (US) — Aria, female"),
+            ("en-US-JennyNeural",  "English (US) — Jenny, female"),
+            ("en-GB-SoniaNeural",  "English (UK) — Sonia, female"),
+            ("en-IN-NeerjaNeural", "English (India) — Neerja, female"),
+            ("hi-IN-SwaraNeural",  "Hindi — Swara, female"),
+        ]
+        for tag, label in self._voice_options:
+            self._f_voice.addItem(label, tag)
+        cur_voice = c.get("tts_voice", "en-US-AriaNeural")
+        idx = next((i for i, (tag, _) in enumerate(self._voice_options) if tag == cur_voice), 0)
+        self._f_voice.setCurrentIndex(idx)
+        self._row(root, "Voice", self._f_voice)
+
+        root.addStretch()
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
+        # ---- Save button ----
+        save_row = QHBoxLayout()
+        save_row.setContentsMargins(16, 4, 16, 14)
+        self._save_btn = QPushButton("💾  Save Settings")
+        self._save_btn.setFixedHeight(34)
+        self._save_btn.setCursor(Qt.PointingHandCursor)
+        self._save_btn.setStyleSheet("""
+            QPushButton { background: rgba(0,80,120,220); color: #E8FBFF;
+                border: 1px solid rgba(0,220,255,140); border-radius: 8px;
+                font-size: 10px; font-weight: 600; }
+            QPushButton:hover { background: rgba(0,110,160,240); border: 1px solid rgb(0,240,255); }
+            QPushButton:pressed { background: rgba(0,140,200,255); }
+        """)
+        self._save_btn.clicked.connect(self._on_save)
+        save_row.addWidget(self._save_btn)
+        outer.addLayout(save_row)
+
+    def _on_save(self):
+        stop_text = self._f_stop.text().strip()
+        stop_list = [s.strip() for s in stop_text.split(",") if s.strip()] if stop_text else []
+        new_cfg = dict(self.cfg)
+        new_cfg.update({
+            "model":             self._f_model.text().strip() or "qwen2.5:1.5b",
+            "ollama_host":       self._f_host.text().strip() or "http://localhost:11434",
+            "gpu_layers":        self._f_gpu.value(),
+            "cpu_threads":       self._f_threads.value(),
+            "batch_size":        self._f_batch.value(),
+            "context_length":    self._f_ctx.value(),
+            "system_prompt":     self._f_sysprompt.toPlainText(),
+            "stop_tokens":       stop_list,
+            "temperature":       self._f_temp.value(),
+            "top_p":             self._f_topp.value(),
+            "top_k":             self._f_topk.value(),
+            "min_p":             self._f_minp.value(),
+            "repeat_penalty":    self._f_repeat.value(),
+            "presence_penalty":  self._f_presence.value(),
+            "frequency_penalty": self._f_frequency.value(),
+            "json_mode":         self._f_json.isChecked(),
+            "streaming":         self._f_stream.isChecked(),
+            "thinking_mode":     self._f_thinking.isChecked(),
+            "seed":              self._f_seed.value(),
+            "tts_enabled":       self._f_tts_on.isChecked(),
+            "tts_voice":         self._f_voice.currentData(),
+        })
+        self.cfg = new_cfg
+        self.saved.emit(new_cfg)
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        super().closeEvent(event)
+
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, W, H), 14, 14)
+        bg = QLinearGradient(0, 0, W, H)
+        bg.setColorAt(0, QColor(3, 6, 16, 252))
+        bg.setColorAt(1, QColor(6, 10, 24, 252))
+        p.fillPath(path, QBrush(bg))
+        p.setPen(QPen(QColor(0, 200, 255, 80), 1.5))
+        p.setBrush(Qt.NoBrush); p.drawPath(path)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_pos = e.globalPos() - self.frameGeometry().topLeft()
+        else:
+            super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.LeftButton and self._drag_pos:
+            self.move(e.globalPos() - self._drag_pos)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+
+
+# ------------------------------------------------
+# Small floating preview of the hand-gesture camera feed (optional, purely
+# visual — helps the user calibrate their hand position, no logic here).
+class HandPreviewWindow(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(260, 200)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        self._label = QLabel("Starting camera…")
+        self._label.setAlignment(Qt.AlignCenter)
+        self._label.setStyleSheet(
+            "background: rgba(7,10,20,230); color:#00E0FF; border:1px solid rgba(0,200,255,90); border-radius:10px;")
+        self._label.setFixedSize(248, 188)
+        lay.addWidget(self._label)
+
+    def update_frame(self, qimg: QImage):
+        pix = QPixmap.fromImage(qimg).scaled(
+            self._label.width(), self._label.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._label.setPixmap(pix)
+
+    def show_message(self, text: str):
+        self._label.setText(text)
+
+
+# ------------------------------------------------
+# Main Window (UI only)
+class ISHAWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ISHA")
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(760, 82)
+        self._centre()
+        self._drag_pos   = None
+        self._mic_on     = False
+        self._chat_vis   = False
+        self._qs_popup   = None
+        self._comm_dock  = None          # communication dock window
+        self._history_win = None         # chat history window
+        self._config_win  = None         # model / voice configuration window
+        self.cfg          = load_config()
+        self._llm_worker  = None
+        self._router_worker = None       # intent-parser worker (see _route_intent)
+        self._conv_history = []          # in-memory chat turns sent to the model
+        self._os_worker    = None        # generic OSTaskWorker in flight (window/file/browser ops)
+        self._latest_stats = {}          # last CPU/RAM/Battery reading
+
+        self.os_controller = None
+        self.stats_monitor  = None
+        if _OS_CONTROL_OK:
+            self.os_controller = WindowsController()
+            self.stats_monitor = SystemStatsMonitor(self.os_controller, interval=2.0)
+            self.stats_monitor.stats_updated.connect(self._on_stats_updated)
+            self.stats_monitor.error_occurred.connect(lambda m: print(f"[Stats] {m}"))
+            self.stats_monitor.start()
+
+        # Hand-gesture control (webcam)
+        self.hand_worker      = None
+        self._hand_preview_win = None
+        self._hand_muted      = False
+        self._hand_last_volume = None
+        self._tts_worker  = None
+        self._tts_busy    = False
+        self._tts_queue   = []
+        self._mic_thread  = None
+        self._stars  = [Star(760, 82) for _ in range(72)]
+        self._ptimer = QTimer(self)
+        self._ptimer.timeout.connect(self._tick)
+        self._ptimer.start(15)
+        self._build_ui()
+        # Fade-in
+        self.setWindowOpacity(0.0)
+        fa = QPropertyAnimation(self, b"windowOpacity")
+        fa.setDuration(650); fa.setStartValue(0.0); fa.setEndValue(1.0)
+        fa.setEasingCurve(QEasingCurve.OutCubic); fa.start()
+        self._fa = fa
+        # Greet
+        QTimer.singleShot(900, self._greet)
+
+    def _build_ui(self):
+        root = QWidget(self)
+        root.setAttribute(Qt.WA_TranslucentBackground)
+        self.setCentralWidget(root)
+        ml = QVBoxLayout(root)
+        ml.setContentsMargins(0, 0, 0, 0); ml.setSpacing(0)
+        upper = QWidget(root)
+        upper.setAttribute(Qt.WA_TranslucentBackground)
+        upper.setFixedHeight(0)
+        ul = QVBoxLayout(upper)
+        ul.setContentsMargins(16, 0, 16, 6); ul.setSpacing(6)
+        ul.addStretch(); ml.addWidget(upper)
+        bar = QWidget(root)
+        bar.setAttribute(Qt.WA_TranslucentBackground); bar.setFixedHeight(82)
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(18, 11, 18, 11); bl.setSpacing(10)
+        self.mic_btn      = MicButton(bar)
+        self.search_bar   = SearchBar(bar)
+        self.wave_bar     = WaveformBar(bar)
+        self.dots         = ThinkingDots(bar)
+        self.settings_btn = SettingsButton(bar)
+        self.mic_btn.clicked.connect(self._toggle_mic)
+        self.search_bar.submitted.connect(self._on_typed)
+        self.settings_btn.clicked.connect(self._toggle_qs)
+        bl.addWidget(self.mic_btn); bl.addWidget(self.search_bar)
+        bl.addWidget(self.wave_bar); bl.addWidget(self.dots)
+        bl.addWidget(self.settings_btn)
+        ml.addWidget(bar)
+
+        self._bubble = BubbleLabel(self)
+        self._chat   = ChatPanel(self); self._chat.hide()
+        # Removed separate CommDock button; now it's inside Quick Settings
+        self._gesture_lbl = QLabel("ak", self)
+        self._gesture_lbl.setFont(QFont("Segoe UI", 7))
+        self._gesture_lbl.setStyleSheet(
+            "color: rgba(0,200,255,160); background: transparent; padding: 1px 4px;"
+        )
+        self._gesture_lbl.setFixedWidth(160)
+        self._gesture_lbl.move(8, self.height() - 18)
+        self._gesture_lbl.show()
+        self._gesture_lbl_timer = QTimer(self)
+        self._gesture_lbl_timer.setSingleShot(True)
+        self._gesture_lbl_timer.timeout.connect(
+            lambda: self._gesture_lbl.setText("Gesture: Idle"))
+
+    # ---- Communication Dock toggling ----
+    def toggle_comm_dock(self, on: bool):
+        if on:
+            if not self._comm_dock:
+                self._comm_dock = CommDockWindow()
+                self._comm_dock.closed.connect(self._on_comm_dock_closed)
+                sc = QApplication.primaryScreen().geometry()
+                self._comm_dock.move(
+                    sc.width()  - self._comm_dock.width()  - 20,
+                    sc.height() - self._comm_dock.height() - 80,
+                )
+            self._comm_dock.show()
+            self._comm_dock.raise_()
+            # sync toggle state in QuickSettings if open
+            if self._qs_popup and self._qs_popup.isVisible():
+                self._qs_popup._t_comm_dock.set_on(True)
+        else:
+            if self._comm_dock:
+                self._comm_dock.hide()
+            # sync toggle state in QuickSettings if open
+            if self._qs_popup and self._qs_popup.isVisible():
+                self._qs_popup._t_comm_dock.set_on(False)
+
+    def _on_comm_dock_closed(self):
+        # user closed the CommDock window via X button
+        if self._qs_popup and self._qs_popup.isVisible():
+            self._qs_popup._t_comm_dock.set_on(False)
+        if self._comm_dock:
+            self._comm_dock.hide()
+
+    # ---- History window toggling ----
+    def toggle_history_window(self, on: bool):
+        if on:
+            if not self._history_win:
+                self._history_win = HistoryWindow()
+                self._history_win.closed.connect(self._on_history_closed)
+            else:
+                self._history_win.refresh()
+            sc = QApplication.primaryScreen().geometry()
+            self._history_win.move(
+                (sc.width()  - self._history_win.width())  // 2,
+                (sc.height() - self._history_win.height()) // 2 - 40,
+            )
+            self._history_win.show()
+            self._history_win.raise_()
+            if self._qs_popup and self._qs_popup.isVisible():
+                self._qs_popup._t_chat_history.set_on(True)
+        else:
+            if self._history_win:
+                self._history_win.hide()
+            if self._qs_popup and self._qs_popup.isVisible():
+                self._qs_popup._t_chat_history.set_on(False)
+
+    def _on_history_closed(self):
+        # user closed the History window via X button
+        if self._qs_popup and self._qs_popup.isVisible():
+            self._qs_popup._t_chat_history.set_on(False)
+        if self._history_win:
+            self._history_win.hide()
+
+    # ---- Model/Voice configuration window toggling ----
+    def toggle_config_dialog(self, on: bool):
+        if on:
+            if not self._config_win:
+                self._config_win = ConfigWindow(self.cfg, self)
+                self._config_win.saved.connect(self._on_config_saved)
+                self._config_win.closed.connect(self._on_config_dialog_closed)
+            sc = QApplication.primaryScreen().geometry()
+            self._config_win.move(
+                (sc.width()  - self._config_win.width())  // 2,
+                (sc.height() - self._config_win.height()) // 2,
+            )
+            self._config_win.show()
+            self._config_win.raise_()
+            if self._qs_popup and self._qs_popup.isVisible():
+                self._qs_popup._t_model_settings.set_on(True)
+        else:
+            if self._config_win:
+                self._config_win.hide()
+            if self._qs_popup and self._qs_popup.isVisible():
+                self._qs_popup._t_model_settings.set_on(False)
+
+    def _on_config_dialog_closed(self):
+        # user closed the Configurations window via X button
+        if self._qs_popup and self._qs_popup.isVisible():
+            self._qs_popup._t_model_settings.set_on(False)
+        if self._config_win:
+            self._config_win.hide()
+
+    def _on_config_saved(self, new_cfg: dict):
+        self.cfg = new_cfg
+        save_config(self.cfg)
+        self.respond("Settings saved. Naya configuration ab se use hoga.", "isha")
+
+    # ---- Hand-gesture control (webcam + MediaPipe, see isha_hand_control.py) ----
+    def toggle_hand_control(self, on: bool):
+        if on:
+            if not _HAND_CONTROL_OK:
+                self.respond(
+                    "Hand control ke liye install karo: pip install opencv-python mediapipe",
+                    "isha")
+                if self._qs_popup and self._qs_popup.isVisible():
+                    self._qs_popup._t_hand_control.set_on(False)
+                return
+            if self.hand_worker is not None:
+                return  # already running
+            self.hand_worker = HandGestureWorker(camera_index=0, emit_preview=True)
+            self.hand_worker.gesture_action.connect(self._on_gesture_action)
+            self.hand_worker.status_changed.connect(self._on_hand_status)
+            self.hand_worker.error_occurred.connect(self._on_hand_error)
+            self.hand_worker.frame_ready.connect(self._on_hand_frame)
+            self.hand_worker.finished.connect(self._on_hand_worker_finished)
+            if self._hand_preview_win is None:
+                self._hand_preview_win = HandPreviewWindow(self)
+            sc = QApplication.primaryScreen().geometry()
+            self._hand_preview_win.move(sc.width() - 280, 40)
+            self._hand_preview_win.show_message("Starting camera…")
+            self._hand_preview_win.show()
+            self.hand_worker.start()
+            if self._qs_popup and self._qs_popup.isVisible():
+                self._qs_popup._t_hand_control.set_on(True)
+        else:
+            if self.hand_worker is not None:
+                self.hand_worker.stop()
+                self.hand_worker.wait(1500)
+                self.hand_worker = None
+            if self._hand_preview_win is not None:
+                self._hand_preview_win.hide()
+            self.respond("Hand control off.", "isha")
+            if self._qs_popup and self._qs_popup.isVisible():
+                self._qs_popup._t_hand_control.set_on(False)
+
+    def _on_hand_worker_finished(self):
+        # Worker thread ended on its own (e.g. camera error) -> reflect it in the UI
+        self.hand_worker = None
+        if self._hand_preview_win is not None:
+            self._hand_preview_win.hide()
+        if self._qs_popup and self._qs_popup.isVisible():
+            self._qs_popup._t_hand_control.set_on(False)
+
+    def _on_hand_status(self, msg: str):
+        self.respond(msg, "isha")
+
+    def _on_hand_error(self, msg: str):
+        self.respond(f"Hand control: {msg}", "isha")
+        if self._hand_preview_win is not None:
+            self._hand_preview_win.show_message(msg)
+
+    def _on_hand_frame(self, qimg: QImage):
+        if self._hand_preview_win is not None and self._hand_preview_win.isVisible():
+            self._hand_preview_win.update_frame(qimg)
+
+    def _on_gesture_action(self, action: str, payload: dict):
+        """Runs on the UI thread (Qt queues cross-thread signals automatically).
+        This is the ONLY place gesture output turns into real OS changes —
+        the worker thread itself never touches pycaw/win32 directly."""
+        if action == "volume_set":
+            pct = int(payload.get("percent", 0))
+            prev = self._hand_last_volume if self._hand_last_volume is not None else pct
+            set_system_volume(pct, prev)
+            self._hand_last_volume = pct
+            if self._qs_popup and self._qs_popup.isVisible():
+                self._qs_popup._vol.blockSignals(True)
+                self._qs_popup._vol.setValue(pct)
+                self._qs_popup._vol.blockSignals(False)
+                self._qs_popup._last_vol = pct
+
+        elif action == "mute_toggle":
+            self._hand_muted = not self._hand_muted
+            set_system_mute(self._hand_muted)
+            self.respond("Muted (gesture)." if self._hand_muted else "Unmuted (gesture).", "isha")
+            if self._qs_popup and self._qs_popup.isVisible():
+                self._qs_popup._t_mute.set_on(self._hand_muted)
+
+        elif action == "scroll":
+            if self.os_controller is not None:
+                self.os_controller.scroll(payload.get("direction", "up"))
+
+    # ------------------------------------------------
+    def respond(self, text: str, role: str = "isha"):
+        if not text: return
+        print(f"[{role}] {text}")
+        self._place_bubble(text)
+        self._bubble.show_text(text, role)
+        self._chat.add_entry(text, role)
+        log_chat_entry(role, text)                     # save into day-by-day history file
+        if self._comm_dock and self._comm_dock.isVisible():
+            # Comm Dock only ever shows messages exchanged while it's open (live only)
+            who = "ISHA" if role == "isha" else "You"
+            ts  = datetime.now().strftime("%I:%M %p")
+            self._comm_dock._log_area.append(f"[{ts}] {who}: {text}")
+        if role == "isha":
+            short = text[:46] + ("…" if len(text) > 46 else "")
+            self.search_bar.setPlaceholderText(f"✦  {short}")
+            QTimer.singleShot(5500, lambda:
+                self.search_bar.setPlaceholderText("Ask ISHA anything…"))
+            self._speak(text)
+
+    def _place_bubble(self, text: str):
+        fm   = QFontMetrics(QFont("Segoe UI", 11))
+        mw   = min(520, self.width() - 40)
+        rect = fm.boundingRect(QRectF(0, 0, mw, 9999).toRect(),
+                                Qt.TextWordWrap, text)
+        bw = rect.width() + 52; bh = rect.height() + 30
+        bx = (self.width() - bw) // 2
+        by = self.height() - 82 - bh - 8
+        self._bubble.setParent(self)
+        self._bubble.setFixedSize(bw, bh)
+        self._bubble.move(bx, max(2, by))
+
+    def _on_typed(self, text: str):
+        self.respond(text, "user")
+        self._send_to_llm(text)
+
+    # ---- Windows OS Control (see isha_os_control.py) ----
+    def _run_os_task(self, method, *args, on_success=None, on_error=None, **kwargs):
+        """Run any WindowsController method off the UI thread. Only one
+        OS task runs at a time to avoid overlapping window/file operations."""
+        if not _OS_CONTROL_OK or self.os_controller is None:
+            self.respond("OS control module load nahi hua (isha_os_control.py / pywin32 check karo).", "isha")
+            return
+        if self._os_worker is not None:
+            self.respond("Pichla OS task abhi chal raha hai, thoda ruko.", "isha")
+            return
+        self._os_worker = OSTaskWorker(method, *args, **kwargs)
+
+        def _finished(result: dict):
+            self._os_worker = None
+            if on_success:
+                on_success(result)
+            else:
+                self.respond(result.get("message", ""), "isha")
+
+        def _errored(msg: str):
+            self._os_worker = None
+            (on_error or (lambda m: self.respond(f"OS task fail: {m}", "isha")))(msg)
+
+        self._os_worker.task_finished.connect(_finished)
+        self._os_worker.task_error.connect(_errored)
+        self._os_worker.start()
+
+    def _on_stats_updated(self, stats: dict):
+        """Live CPU/RAM/Battery feed from SystemStatsMonitor -> update UI."""
+        self._latest_stats = stats
+        if self._qs_popup is not None:
+            self._qs_popup.update_stats(stats)
+
+    # ---- Local LLM (Ollama) ----
+    def _build_ollama_options(self) -> dict:
+        c = self.cfg
+        opts = {
+            "num_batch":         int(c.get("batch_size", 512)),
+            "num_ctx":           int(c.get("context_length", 4096)),
+            "temperature":       float(c.get("temperature", 0.8)),
+            "top_p":             float(c.get("top_p", 0.9)),
+            "top_k":             int(c.get("top_k", 40)),
+            "min_p":             float(c.get("min_p", 0.0)),
+            "repeat_penalty":    float(c.get("repeat_penalty", 1.1)),
+            "presence_penalty":  float(c.get("presence_penalty", 0.0)),
+            "frequency_penalty": float(c.get("frequency_penalty", 0.0)),
+        }
+        gpu_layers = int(c.get("gpu_layers", -1))
+        if gpu_layers >= 0:
+            opts["num_gpu"] = gpu_layers
+        cpu_threads = int(c.get("cpu_threads", 0))
+        if cpu_threads > 0:
+            opts["num_thread"] = cpu_threads
+        stop_raw = c.get("stop_tokens", [])
+        stop_list = stop_raw if isinstance(stop_raw, list) else \
+            [s.strip() for s in str(stop_raw).split(",") if s.strip()]
+        if stop_list:
+            opts["stop"] = stop_list
+        seed = int(c.get("seed", -1))
+        if seed >= 0:
+            opts["seed"] = seed
+        return opts
+
+    def _send_to_llm(self, user_text: str):
+        if self._llm_worker is not None or self._router_worker is not None:
+            return  # a reply is already in flight
+        self.search_bar.setPlaceholderText("⟳  Thinking…")
+        self.dots.start()
+        self._conv_history.append({"role": "user", "content": user_text})
+        self._conv_history = self._conv_history[-30:]
+
+        if _TOOLS_OK and bool(self.cfg.get("tool_calling", True)):
+            self._route_intent(user_text)
+        else:
+            self._start_chat_completion()
+
+    # ---- Step 1: Intent Parser / Function-Calling router ----
+    def _route_intent(self, user_text: str):
+        """Ask the model (JSON-mode, non-streaming) whether this message maps
+        to a registered tool. Uses a minimal, isolated message list — not the
+        full conversation history — so routing stays fast and unambiguous."""
+        router_messages = [
+            {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_text},
+        ]
+        self._router_worker = OllamaWorker(
+            host=self.cfg.get("ollama_host", "http://localhost:11434"),
+            model=self.cfg.get("router_model") or self.cfg.get("model", "qwen2.5:1.5b"),
+            messages=router_messages,
+            options=self._build_ollama_options(),
+            streaming=False,
+            json_mode=True,       # force structured JSON output
+            thinking=False,
+        )
+        self._router_worker.finished_reply.connect(self._on_router_finished)
+        self._router_worker.error_occurred.connect(self._on_router_error)
+        self._router_worker.start()
+
+    def _on_router_error(self, msg: str):
+        # Router unreachable/broken -> fail safe into normal conversation,
+        # never block the user from chatting because tool routing hiccuped.
+        self._router_worker = None
+        self._start_chat_completion()
+
+    def _on_router_finished(self, raw_text: str):
+        self._router_worker = None
+        decision = parse_router_json(raw_text)
+
+        if not decision or decision.get("action") != "tool_call" or not decision.get("tool"):
+            # Plain conversation — nothing to execute.
+            self._start_chat_completion()
+            return
+
+        tool_name = str(decision.get("tool"))
+        args = decision.get("arguments") or {}
+        try:
+            result = execute_tool(tool_name, args)   # validated + sandboxed inside isha_tools.py
+            note = f"[TOOL RESULT] '{tool_name}' ran successfully -> {result}"
+        except ToolError as e:
+            note = f"[TOOL ERROR] '{tool_name}' could not run -> {e}"
+
+        # Feed the outcome back as a system note so the *main* model phrases
+        # a natural spoken/chat reply around it, instead of us hardcoding text.
+        self._conv_history.append({"role": "system", "content": note})
+        self._start_chat_completion()
+
+    # ---- Step 2: normal streaming chat completion ----
+    def _start_chat_completion(self):
+        messages = []
+        sys_prompt = str(self.cfg.get("system_prompt", "")).strip()
+        if sys_prompt:
+            messages.append({"role": "system", "content": sys_prompt})
+        messages.extend(self._conv_history)
+
+        streaming = bool(self.cfg.get("streaming", True))
+        if streaming:
+            self._bubble.begin_stream()
+            self._place_bubble(" ")
+
+        self._llm_worker = OllamaWorker(
+            host=self.cfg.get("ollama_host", "http://localhost:11434"),
+            model=self.cfg.get("model", "qwen2.5:1.5b"),
+            messages=messages,
+            options=self._build_ollama_options(),
+            streaming=streaming,
+            json_mode=bool(self.cfg.get("json_mode", False)),
+            thinking=bool(self.cfg.get("thinking_mode", False)),
+        )
+        self._llm_worker.chunk_received.connect(self._on_llm_chunk)
+        self._llm_worker.finished_reply.connect(self._on_llm_finished)
+        self._llm_worker.error_occurred.connect(self._on_llm_error)
+        self._llm_worker.start()
+
+    def _on_llm_chunk(self, text: str):
+        self._bubble.update_streaming_text(text)
+        self._place_bubble(text)
+
+    def _on_llm_finished(self, text: str):
+        self.dots.stop()
+        self._llm_worker = None
+        text = text.strip() or "Khali jawab mila — Ollama aur model name check karo."
+        self._conv_history.append({"role": "assistant", "content": text})
+        self.respond(text, "isha")
+
+    def _on_llm_error(self, msg: str):
+        self.dots.stop()
+        self._llm_worker = None
+        self.respond(msg, "isha")
+
+    # ---- Voice output (Edge-TTS) ----
+    def _speak(self, text: str):
+        if not self.cfg.get("tts_enabled", True) or not _TTS_OK:
+            return
+        clean = re.sub(r"[⚠✦⟳●]", "", text).strip()
+        if not clean:
+            return
+        self._tts_queue.append(clean)
+        self._process_tts_queue()
+
+    def _process_tts_queue(self):
+        if self._tts_busy or not self._tts_queue:
+            return
+        text = self._tts_queue.pop(0)
+        self._tts_busy = True
+        self._tts_worker = TTSWorker(
+            text,
+            voice=self.cfg.get("tts_voice", "en-US-AriaNeural"),
+            rate=self.cfg.get("tts_rate", "+0%"),
+        )
+        self._tts_worker.finished_speaking.connect(self._on_tts_done)
+        self._tts_worker.error_occurred.connect(lambda m: print(f"[TTS] {m}"))
+        self._tts_worker.start()
+
+    def _on_tts_done(self):
+        self._tts_busy = False
+        self._tts_worker = None
+        self._process_tts_queue()
+
+    # ---- Voice input (microphone) ----
+    def _start_mic_listening(self):
+        if self._mic_thread is not None:
+            return
+        self._mic_thread = MicListenerThread(language="en-IN")
+        self._mic_thread.speech_recognized.connect(self._on_speech_recognized)
+        self._mic_thread.error_occurred.connect(self._on_speech_error)
+        self._mic_thread.start()
+
+    def _stop_mic_listening(self):
+        if self._mic_thread is not None:
+            self._mic_thread.stop()
+            self._mic_thread = None
+
+    def _on_speech_recognized(self, text: str):
+        text = text.strip()
+        if not text:
+            return
+        self.respond(text, "user")
+        self._send_to_llm(text)
+
+    def _on_speech_error(self, msg: str):
+        print(f"[STT] {msg}")
+
+    def _toggle_mic(self):
+        self._mic_on = not self._mic_on
+        self.mic_btn.set_active(self._mic_on)
+        self.wave_bar.set_active(self._mic_on)
+        if self._mic_on:
+            if not _STT_OK:
+                self.respond(
+                    "Microphone input ke liye install karo: pip install SpeechRecognition PyAudio",
+                    "isha")
+                self._mic_on = False
+                self.mic_btn.set_active(False)
+                self.wave_bar.set_active(False)
+                return
+            self.respond("Microphone activated. Boliye…", "isha")
+            self._start_mic_listening()
+        else:
+            self.respond("Microphone off.", "isha")
+            self._stop_mic_listening()
+
+    def _toggle_qs(self):
+        if not self._qs_popup:
+            self._qs_popup = QuickSettingsPopup(self)
+        btn_g = self.mapToGlobal(self.settings_btn.pos())
+        popup_w = self._qs_popup.sizeHint().width() or 290
+        popup_h = self._qs_popup.sizeHint().height() or 420
+        px = btn_g.x() - popup_w + 54
+        py = btn_g.y() - popup_h - 12
+        self._qs_popup.toggle(QPoint(px, py))
+
+    def _greet(self):
+        self.respond("Good to see you, Boss!", "isha")
+
+    def _tick(self):
+        for s in self._stars: s.update()
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        W, H = self.width(), self.height()
+        cap = QPainterPath()
+        cap.addRoundedRect(QRectF(0, H - 82, W, 82), 41, 41)
+        p.setClipPath(cap)
+        bg = QLinearGradient(0, H - 82, W, H)
+        bg.setColorAt(0.0, QColor(  7, 10, 20, 254))
+        bg.setColorAt(0.5, QColor( 18, 23, 38, 252))
+        bg.setColorAt(1.0, QColor(  7, 10, 20, 254))
+        p.fillPath(cap, QBrush(bg))
+        stars = self._stars
+        for i in range(len(stars)):
+            for j in range(i + 1, min(i + 10, len(stars))):
+                d = math.hypot(stars[i].x - stars[j].x, stars[i].y - stars[j].y)
+                if d < 70:
+                    a = int(50 * (1 - d / 70))
+                    p.setPen(QPen(QColor(0, 180, 220, a), 0.5))
+                    p.drawLine(QPointF(stars[i].x, H - 82 + stars[i].y),
+                               QPointF(stars[j].x, H - 82 + stars[j].y))
+        p.setPen(Qt.NoPen)
+        for s in stars:
+            p.setBrush(QBrush(s.color))
+            p.drawEllipse(QPointF(s.x, H - 82 + s.y), s.sz, s.sz)
+        p.setClipping(False)
+        p.setPen(QPen(QColor(0, 240, 255, 200), 2.0))
+        p.setBrush(Qt.NoBrush); p.drawPath(cap)
+        sheen = QPainterPath()
+        sheen.addRoundedRect(QRectF(3, H - 82 + 3, W - 6, 28), 38, 38)
+        p.fillPath(sheen, QColor(255, 255, 255, 6))
+        cx = W // 2
+        lg = QLinearGradient(cx - 120, H - 82, cx + 120, H - 82)
+        lg.setColorAt(0.0, QColor(0, 0, 0, 0))
+        lg.setColorAt(0.5, QColor(0, 240, 255, 60))
+        lg.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setPen(QPen(QBrush(lg), 1))
+        p.drawLine(QPointF(cx - 120, H - 41), QPointF(cx + 120, H - 41))
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_pos = e.globalPos() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.LeftButton and self._drag_pos:
+            self.move(e.globalPos() - self._drag_pos)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+
+    def _centre(self):
+        sc = QApplication.primaryScreen().geometry()
+        self.move(
+            (sc.width()  - self.width())  // 2,
+             sc.height() - self.height()  - 60,
+        )
+
+    def closeEvent(self, event):
+        self._stop_mic_listening()
+        if self._llm_worker is not None:
+            self._llm_worker.stop()
+        if self._router_worker is not None:
+            self._router_worker.stop()
+        if self.stats_monitor is not None:
+            self.stats_monitor.stop()
+            self.stats_monitor.wait(1000)
+        if self._os_worker is not None:
+            self._os_worker.wait(1000)
+        if self.hand_worker is not None:
+            self.hand_worker.stop()
+            self.hand_worker.wait(1500)
+        super().closeEvent(event)
+
+
+# ------------------------------------------------
+# Entry point
+def main():
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps,    True)
+    app = QApplication(sys.argv)
+    app.setApplicationName("ISHA UI Demo")
+    win = ISHAWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
