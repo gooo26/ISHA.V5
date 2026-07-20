@@ -3,31 +3,32 @@
 ## funny Question 
 
 Question 
-```
-Agar ek ghori (female horse) ne bilkul border par bacha diya—aadha shareer India me aur aadha Pakistan me—toh wo bacha kiska hoga?
-```
 
-```
-Ek bandar kela chheel raha hai, aur ek kutta usko dekh raha hai. Batao kela kaun khayega?
-```
-
-```
-Ek aeroplane crash ho gaya aur usme sabhi log mar gaye. Lekin do log bach gaye. Batao kaise?
-```
-
-Agar ek red house laal bricks se bana hai, aur ek blue house neeli bricks se bana hai, toh "Green House" kis cheez se bana hota hai?
-
-Ek andhere kamre me ek mombatti (candle) aur ek lalten (lantern) rakhi hai. Aapke paas sirf ek machis ki teeli (matchstick) hai. Aap sabse pehle kya jalaoge?
-
-Ek kisaan ke paas 17 bakriyan (goats) thin. Ek bimari aayi aur 9 ko chhodkar sab mar gayin. Ab kisaan ke paas kitni bakriyan bachi hain?
-
-Ek haathi paani me gir gaya, ab wo kaise nikalega?
-
-Socho aap ek race me daud rahe ho. Daudte-daudte aapne second position waale runner ko overtake kar diya (uske aage nikal gaye). Toh ab aap kaunsi position par ho?
+## Agar ek ghori (female horse) ne bilkul border par bacha diya—aadha shareer India me aur aadha Pakistan me—toh wo bacha kiska hoga?
 
 
 
-Answer 
+## Ek bandar kela chheel raha hai, aur ek kutta usko dekh raha hai. Batao kela kaun khayega?
+
+
+
+## Ek aeroplane crash ho gaya aur usme sabhi log mar gaye. Lekin do log bach gaye. Batao kaise?
+
+
+## Agar ek red house laal bricks se bana hai, aur ek blue house neeli bricks se bana hai, toh "Green House" kis cheez se bana hota hai?
+
+## Ek andhere kamre me ek mombatti (candle) aur ek lalten (lantern) rakhi hai. Aapke paas sirf ek machis ki teeli (matchstick) hai. Aap sabse pehle kya jalaoge?
+
+## Ek kisaan ke paas 17 bakriyan (goats) thin. Ek bimari aayi aur 9 ko chhodkar sab mar gayin. Ab kisaan ke paas kitni bakriyan bachi hain?
+
+## Ek haathi paani me gir gaya, ab wo kaise nikalega?
+
+## Socho aap ek race me daud rahe ho. Daudte-daudte aapne second position waale runner ko overtake kar diya (uske aage nikal gaye). Toh ab aap kaunsi position par ho?
+
+
+
+### Answer 
+
 ```
 Ghoda ya ghori anda nahi dete, bacha dete hain! (Lekin agar bacha poocha hai, toh wo ghori ka hi hoga, borders ka kya lena dena!).
 ```
