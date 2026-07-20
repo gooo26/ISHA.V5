@@ -23,6 +23,8 @@ Ek kisaan ke paas 17 bakriyan (goats) thin. Ek bimari aayi aur 9 ko chhodkar sab
 
 Ek haathi paani me gir gaya, ab wo kaise nikalega?
 
+Socho aap ek race me daud rahe ho. Daudte-daudte aapne second position waale runner ko overtake kar diya (uske aage nikal gaye). Toh ab aap kaunsi position par ho?
+
 
 
 Answer 
@@ -53,4 +55,6 @@ Sabse pehle machis ki teeli jalaenge!
 ```
 Geela hokar nikalega!
 ```
-
+```
+Aap Second position par ho! Kyunki aapne second waale ko piche chhoda hai, toh uski jagah ab aap aa gaye. First waala toh abhi bhi aage hi hai.
+```
