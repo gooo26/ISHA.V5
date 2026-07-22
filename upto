@@ -2704,8 +2704,8 @@ class ConfigWindow(QWidget):
             QScrollBar::handle:vertical { background: rgba(0,240,255,140); border-radius: 2px; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
         """)
-        body = QWidget(); body.setAttribute(Qt.WA_TranslucentBackground)
-        body.setStyleSheet(self._INPUT_QSS)
+        body = QWidget()
+        body.setStyleSheet("QWidget { background-color: #070A14; }" + self._INPUT_QSS)
         root = QVBoxLayout(body)
         root.setContentsMargins(16, 4, 16, 12); root.setSpacing(6)
 
